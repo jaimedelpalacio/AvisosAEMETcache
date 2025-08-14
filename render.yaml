@@ -1,7 +1,12 @@
+# render.yaml
+# Servicio web Node (sin Dockerfile). El cron se crea a mano en el panel de Render.
+
 services:
   - type: web
     name: aemet-avisos-zona-cache
     env: node
+    plan: free
+    autoDeploy: true
     buildCommand: "npm install"
     startCommand: "npm start"
     envVars:
@@ -9,10 +14,3 @@ services:
         value: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJqYWltZUBtaXNzaW9udHJhY2suY29tIiwianRpIjoiMzQ1OWE5MmYtM2RmNS00NWQwLTgyNWYtNDA4ZWNjMzcxODkxIiwiaXNzIjoiQUVNRVQiLCJpYXQiOjE3MDcwNDEwODYsInVzZXJJZCI6IjM0NTlhOTJmLTNkZjUtNDVkMC04MjVmLTQwOGVjYzM3MTg5MSIsInJvbGUiOiIifQ.Wg_hkuQdAlqVR8dbtbQgxIF5fAam1ehJ3-bDV27qgaA'
       - key: AEMET_AREAS
         value: "61,62,63,64,78,65,66,67,68,69,77,70,71,72,79,73,74,75,76"
-
-jobs:
-  - type: cron
-    name: aemet-avisos-zona-refresh
-    schedule: "0 * * * *"
-    env: docker
-    dockerCommand: "curl -fsS https://aemet-avisos-zona-cache.onrender.com/refresh"
