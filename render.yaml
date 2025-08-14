@@ -1,13 +1,7 @@
-# render.yaml
-# Servicio web Node (sin Dockerfile) + Cron Job que llama /refresh cada hora
-# Deja aquí tu API key literal (como pediste) y la lista de áreas de tu imagen.
-
 services:
   - type: web
     name: aemet-avisos-zona-cache
     env: node
-    plan: free
-    autoDeploy: true
     buildCommand: "npm install"
     startCommand: "npm start"
     envVars:
@@ -16,7 +10,9 @@ services:
       - key: AEMET_AREAS
         value: "61,62,63,64,78,65,66,67,68,69,77,70,71,72,79,73,74,75,76"
 
+jobs:
   - type: cron
     name: aemet-avisos-zona-refresh
-    schedule: "0 * * * *"               # cada hora (UTC). Cambia a */30 * * * * si quieres cada 30 min
-    command: "bash -lc 'curl -fsS https://aemet-avisos-zona-cache.onrender.com/refresh'"
+    schedule: "0 * * * *"
+    env: docker
+    dockerCommand: "curl -fsS https://aemet-avisos-zona-cache.onrender.com/refresh"
