@@ -1,0 +1,16 @@
+{
+  "name": "aemet-avisos-cache",
+  "version": "1.0.0",
+  "description": "Microservicio cacheador: lee periódicamente avisos CAP de AEMET (por áreas) y expone consulta rápida por zona (6 dígitos).",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "fast-xml-parser": "^4.3.6",
+    "tar-stream": "^3.1.7",
+    "undici": "^6.19.8"
+  }
+}
