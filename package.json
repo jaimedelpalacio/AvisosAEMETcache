@@ -1,7 +1,7 @@
 {
   "name": "aemet-avisos-zona-cache",
   "version": "1.0.0",
-  "description": "Microservicio con caché horario de avisos CAP (AEMET) e índice por zona (6 dígitos).",
+  "description": "Microservicio con caché de avisos CAP de AEMET por zona (6 dígitos), con índice en memoria.",
   "type": "module",
   "main": "server.js",
   "scripts": {
