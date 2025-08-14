@@ -1,7 +1,13 @@
+# render.yaml
+# Servicio web Node + Cron Job que llama a /refresh cada hora.
+# La API key se define aquí con su valor literal, como en tu configuración original.
+
 services:
   - type: web
     name: aemet-avisos-zona-cache
     env: node
+    plan: free
+    autoDeploy: true
     buildCommand: "npm install"
     startCommand: "npm start"
     envVars:
@@ -12,7 +18,5 @@ services:
 
   - type: cron
     name: aemet-avisos-zona-refresh
-    schedule: "0 * * * *"      # cada hora, minuto 0
-    env: docker
-    dockerCommand: >
-      curl -sS https://aemet-avisos-zona-cache.onrender.com/refresh
+    schedule: "0 * * * *"                    # cada hora (UTC)
+    command: "bash -lc 'curl -fsS https://aemet-avisos-zona-cache.onrender.com/refresh'"
