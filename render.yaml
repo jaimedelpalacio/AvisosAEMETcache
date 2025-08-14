@@ -1,6 +1,6 @@
 # render.yaml
-# Servicio web Node + Cron Job que llama a /refresh cada hora.
-# La API key se define aquí con su valor literal, como en tu configuración original.
+# Servicio web Node (sin Dockerfile) + Cron Job que llama /refresh cada hora
+# Deja aquí tu API key literal (como pediste) y la lista de áreas de tu imagen.
 
 services:
   - type: web
@@ -18,5 +18,5 @@ services:
 
   - type: cron
     name: aemet-avisos-zona-refresh
-    schedule: "0 * * * *"                    # cada hora (UTC)
+    schedule: "0 * * * *"               # cada hora (UTC). Cambia a */30 * * * * si quieres cada 30 min
     command: "bash -lc 'curl -fsS https://aemet-avisos-zona-cache.onrender.com/refresh'"
