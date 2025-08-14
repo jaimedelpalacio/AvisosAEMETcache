@@ -1,23 +1,24 @@
 // Microservicio cacheador AEMET – Avisos CAP por zona (España)
 // ------------------------------------------------------------
 // Qué hace:
-//  - Descarga periódicamente (por /refresh o cron de Render) los avisos CAP por ÁREA de AEMET.
-//  - Parsea y normaliza CAP, construyendo un índice en memoria por zona (6 dígitos).
-//  - Sirve consultas instantáneas: GET /avisos?zona=614102.
-//  - Mantiene "último éxito" (generatedAt) y lo devuelve en las respuestas.
-//  - Resiste fallos parciales de AEMET (continúa con otras áreas) y conserva la última caché válida.
+//  - Descarga (cuando llamas /refresh) los avisos CAP por ÁREA desde AEMET.
+//  - Parsea CAP y construye un índice en memoria por zona (6 dígitos).
+//  - Sirve consultas instantáneas: GET /avisos?zona=NNNNNN.
+//  - Mantiene "último éxito" (generatedAt) y lo expone en /health y en las respuestas.
+//  - Degrada con la última caché válida si una actualización falla.
 //
 // Endpoints:
 //  - GET /avisos?zona=NNNNNN   -> avisos de la zona desde la caché en memoria.
 //  - GET /refresh              -> fuerza un refresco completo (todas las áreas).
 //  - GET /health               -> estado simple + last_success_at.
-//  - GET /stats                -> métricas de la caché (áreas, ficheros, top zonas).
+//  - GET /stats                -> métricas (áreas, ficheros, top zonas).
 //
-// Config por entorno (Render -> envVars en render.yaml):
+// Config (Render -> Variables de entorno):
 //  - AEMET_API_KEY   (obligatoria)
-//  - AEMET_AREAS     (CSV con códigos de área, p.ej. "61,62,63,64,78,65,66,67,68,69,77,70,71,72,79,73,74,75,76")
+//  - AEMET_AREAS     (CSV de áreas: "61,62,63,64,78,65,66,67,68,69,77,70,71,72,79,73,74,75,76")
 //  - PORT            (opcional; por defecto 3000)
 //
+// NOTA: El refresco periódico se hace con un Cron Job en el panel de Render llamando a /refresh.
 // ------------------------------------------------------------
 
 import express from 'express';
@@ -32,25 +33,22 @@ const PORT = process.env.PORT || 3000;
 const UA = 'MT-Neo-AEMET-Cache/1.0';
 const API_KEY = (process.env.AEMET_API_KEY || '').trim();
 
-// Áreas a recorrer en /refresh (ajústalas en render.yaml)
+// Áreas (2 dígitos) a recorrer en /refresh
 const AREAS = (process.env.AEMET_AREAS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
 // ------------------ Estado de caché --------------------------
-// Estructura de caché en memoria. "generatedAt" es la hora del último refresco exitoso completo.
 let cache = {
   version: '1.0',
-  generatedAt: null,           // ISO del último éxito de refresco (lo que pides exponer)
+  generatedAt: null,           // ISO del último refresco exitoso
   areas: [],                   // lista de áreas recorridas
   files: [],                   // metadatos de ficheros vistos
-  alerts: [],                  // alertas parseadas (normalizadas)
+  alerts: [],                  // alertas parseadas
   byZona: new Map()            // índice: zona (6 dígitos) -> [alertas]
 };
-
-// Guardamos la última caché válida para degradación en caso de fallo total
-let lastGoodCache = null;
+let lastGoodCache = null;      // copia de la última caché válida
 
 // ------------------ Utilidades HTTP y TAR/XML ----------------
 
@@ -80,9 +78,9 @@ async function fetchBuffer(url, headers = {}) {
 }
 
 async function fetchJSONSmart(url, headers = {}) {
+  // Decodificación robusta (UTF-8/Latin-1) por si AEMET devuelve charset extraño
   const r = await fetch(url, { headers: { accept: 'application/json,*/*;q=0.8', 'user-agent': UA, ...headers } });
   if (!r.ok) throw new Error(`HTTP ${r.status} en ${url}`);
-
   const buf = Buffer.from(await r.arrayBuffer());
   const ct = (r.headers.get('content-type') || '').toLowerCase();
 
@@ -217,9 +215,11 @@ function buildIndexes(allAlerts) {
   }
 
   for (const a of allAlerts) {
+    // 1) Detectamos zonas por el nombre del fichero (Z_..._614102...xml)
     const m = (a.file || '').match(/(\d{6})/g);
     if (m) for (const z of new Set(m)) add(z, a);
 
+    // 2) Y también por geocodes dentro del XML CAP
     for (const inf of a.info || []) {
       for (const ar of inf.areas || []) {
         for (const g of ar.geocodes || []) {
@@ -290,7 +290,7 @@ async function refreshCache() {
   const allFiles = [];
   const allAlerts = [];
 
-  // Recorremos TODAS las áreas declaradas (si alguna falla, seguimos con el resto)
+  // Recorremos TODAS las áreas (si alguna falla, seguimos con el resto)
   for (const area of AREAS) {
     try {
       const { files, alerts } = await fetchAreaAlerts(area);
@@ -315,7 +315,7 @@ async function refreshCache() {
   };
 
   cache = newCache;
-  lastGoodCache = newCache; // guardamos como última válida
+  lastGoodCache = newCache; // última válida
 
   const ms = Date.now() - started;
   return { areasTried: AREAS.length, files: allFiles.length, alerts: allAlerts.length, ms };
@@ -328,20 +328,17 @@ app.get('/', (_, res) => {
 });
 
 app.get('/health', (_, res) => {
-  // Exponemos "last_success_at" como alias de generatedAt para tu integración
   res.json({ ok: true, last_success_at: cache.generatedAt });
 });
 
 app.get('/stats', (_, res) => {
   const zonesIndexed = cache.byZona.size;
   const topZones = [];
-  for (const [z, arr] of cache.byZona) {
-    topZones.push({ zona: z, count: arr.length });
-  }
+  for (const [z, arr] of cache.byZona) topZones.push({ zona: z, count: arr.length });
   topZones.sort((a, b) => b.count - a.count);
   res.json({
     version: cache.version,
-    generatedAt: cache.generatedAt,   // último éxito de refresco
+    generatedAt: cache.generatedAt,
     areas: cache.areas,
     files: cache.files.length,
     alerts: cache.alerts.length,
@@ -351,13 +348,11 @@ app.get('/stats', (_, res) => {
 });
 
 app.get('/refresh', async (_, res) => {
-  // Fuerza un refresco completo. Si falla todo, devolvemos la última caché válida (stale)
   try {
     const r = await refreshCache();
     res.json({ ok: true, ...r, generatedAt: cache.generatedAt, stale: false });
   } catch (e) {
     if (lastGoodCache) {
-      // Degradación: servimos metadatos de la última buena
       return res.status(200).json({
         ok: false,
         error: String(e.message || e),
@@ -370,7 +365,6 @@ app.get('/refresh', async (_, res) => {
 });
 
 app.get('/avisos', (req, res) => {
-  // Consulta rápida por zona (6 dígitos) desde la caché en memoria
   try {
     const zona = String(req.query.zona || '').trim();
     if (!/^\d{6}$/.test(zona)) {
@@ -379,17 +373,12 @@ app.get('/avisos', (req, res) => {
       throw e;
     }
 
-    // Si nunca se refrescó, intentamos degradar a la última válida (si existe)
+    // Si nunca se refrescó, degradamos a la última válida (si existe)
     const effectiveCache = cache.generatedAt ? cache : (lastGoodCache || cache);
-
     const list = effectiveCache.byZona.get(zona) || [];
 
-    // Devolvemos la hora del último éxito en query.last_success_at (alias de generatedAt)
     res.json({
-      query: {
-        zona,
-        last_success_at: effectiveCache.generatedAt
-      },
+      query: { zona, last_success_at: effectiveCache.generatedAt },
       count: list.length,
       avisos: list
     });
@@ -401,14 +390,7 @@ app.get('/avisos', (req, res) => {
 
 // ------------------ Arranque --------------------------------
 
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log(`AEMET avisos cache escuchando en :${PORT}`);
-  // Nota: el primer refresco lo invocará el cron de Render con GET /refresh.
-  // Si quieres refrescar también al arrancar, descomenta estas líneas:
-  // try {
-  //   const r = await refreshCache();
-  //   console.log('Caché inicial construida:', r);
-  // } catch (e) {
-  //   console.error('Error inicial de caché:', e);
-  // }
+  // El refresco lo ejecutará tu Cron Job en Render llamando a /refresh.
 });
