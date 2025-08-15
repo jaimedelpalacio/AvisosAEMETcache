@@ -1,11 +1,17 @@
 // server.js
 // Microservicio AEMET – caché por zona con refresco vía cron (admin) y lectura pública sin llamadas a AEMET
 // --------------------------------------------------------------------------------------------------------
-// Objetivo:
-//   - Separar la CAPTURA desde AEMET (vía /admin/*, la invoca el cron de Render) de la CONSULTA pública (/avisos),
-//     que solo lee de caché y NUNCA habla con AEMET.
-//   - Acumular todos los avisos de una misma zona presentes en el TAR/XML del “ultimoelaborado” (sin sobrescribir).
-//   - Deduplicar por (file + header.identifier) para evitar entradas repetidas.
+// Objetivo solicitado:
+//   1) Separar CAPTURA (AEMET vía /admin/*, la invoca el cron de Render) de CONSULTA pública (/avisos),
+//      que solo lee de caché y NUNCA llama a AEMET.
+//   2) Para cada zona (6 dígitos), ACUMULAR TODOS los avisos presentes en el TAR/XML “ultimoelaborado”,
+//      sin perder ninguno por sobrescritura, con deduplicación por (file + header.identifier).
+//   3) La respuesta pública debe mantener la ESTRUCTURA del primer servicio (compatible con MT Neo):
+//        { query, ficheros, avisos, stale, cache }
+//      PERO eliminando campos pesados:
+//        - NO devolver `metadatos`
+//        - NO incluir `areas` dentro de `info`
+//        - NO incluir `raw_xml`
 // --------------------------------------------------------------------------------------------------------
 
 import express from 'express';
@@ -17,7 +23,7 @@ import { XMLParser } from 'fast-xml-parser';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const UA = 'MT-Neo-Avisos-Zona/2.1';
+const UA = 'MT-Neo-Avisos-Zona/2.2';
 const AEMET_API_KEY = process.env.AEMET_API_KEY || '';
 const CRON_TOKEN = process.env.RENDER_CRON_TOKEN || '';
 const CACHE_TTL_SECONDS = parseInt(process.env.CACHE_TTL_SECONDS || '1200', 10); // 20 min por defecto
@@ -29,7 +35,7 @@ app.use(express.json({ limit: '4mb' }));
 //
 // Estructura de cada entrada:
 //   {
-//     payload: { query, metadatos, ficheros[], avisos[] },
+//     payload: { query, ficheros[], avisos[] },   // (SIN metadatos)
 //     fetchedAt: <ms epoch>,
 //     stale: boolean
 //   }
@@ -107,27 +113,6 @@ async function tryFetchBuffer(url, headers = {}, { retries = 2, timeoutMs = 1500
   throw lastErr;
 }
 
-async function fetchJSONSmart(url, headers = {}) {
-  // Lectura robusta por si los metadatos vienen con codificación rara
-  const r = await fetchWithTimeout(url, { headers: { accept: 'application/json,*/*;q=0.8', 'user-agent': UA, ...headers } }, 10000);
-  if (!r.ok) throw new Error(`HTTP ${r.status} en ${url}`);
-
-  const buf = Buffer.from(await r.arrayBuffer());
-  const ct = (r.headers.get('content-type') || '').toLowerCase();
-
-  let text;
-  if (ct.includes('iso-8859') || ct.includes('latin1')) {
-    text = buf.toString('latin1');
-  } else {
-    const utf8 = buf.toString('utf8');
-    const lat1 = buf.toString('latin1');
-    const bads = (s) => (s.match(/\uFFFD/g) || []).length;
-    text = bads(lat1) < bads(utf8) ? lat1 : utf8;
-  }
-  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  return JSON.parse(text);
-}
-
 function gunzipIfNeeded(buf) { return isGzip(buf) ? zlib.gunzipSync(buf) : buf; }
 
 async function tarEntries(buf) {
@@ -157,7 +142,7 @@ function decodeToString(b) {
   try { return b.toString('utf8'); } catch { return b.toString('latin1'); }
 }
 
-// ========================= PARSEO CAP v1.2 =========================
+// ========================= PARSEO CAP v1.2 (normalizado) =========================
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -168,9 +153,15 @@ const parser = new XMLParser({
 
 function asArray(x) { return Array.isArray(x) ? x : x == null ? [] : [x]; }
 
-function parseCapXml(xmlText) {
+/**
+ * Parsea un XML CAP y lo normaliza en un array de objetos:
+ *  { header, info[] }
+ * Donde cada info NO incluye "areas" (se eliminan) para aligerar payload.
+ */
+function parseCapXmlWithoutAreas(xmlText) {
   const root = parser.parse(xmlText);
   const alerts = asArray(root?.alert || root?.['cap:alert']);
+
   return alerts.map((alert) => {
     const header = {
       identifier: alert?.identifier ?? null,
@@ -195,18 +186,8 @@ function parseCapXml(xmlText) {
         value: ec?.value ?? ec?.['#text'] ?? null,
       }));
 
-      const areas = asArray(info?.area).map((a) => ({
-        areaDesc: a?.areaDesc ?? null,
-        altitude: a?.altitude ?? null,
-        ceiling: a?.ceiling ?? null,
-        polygons: asArray(a?.polygon).map(String),
-        circles: asArray(a?.circle).map(String),
-        geocodes: asArray(a?.geocode).map((g) => ({
-          valueName: g?.valueName ?? g?.['@_valueName'] ?? null,
-          value: g?.value ?? g?.['#text'] ?? null,
-        })),
-      }));
-
+      // ⚠️ Importante: NO devolvemos "areas" para aligerar la respuesta.
+      // (La pertenencia a zona ya la verificamos antes vía nombre de fichero o geocódigo.)
       return {
         language: info?.language ?? null,
         category,
@@ -224,8 +205,8 @@ function parseCapXml(xmlText) {
         web: info?.web ?? null,
         contact: info?.contact ?? null,
         parameters,
-        eventCode,
-        areas,
+        eventCode
+        // sin areas
       };
     });
 
@@ -237,11 +218,17 @@ function parseCapXml(xmlText) {
 
 function fileMatchesZonaByName(fileName, zona) { return fileName.includes(zona); }
 
-function alertHasZonaByGeocode(parsedAlert, zona) {
-  for (const inf of parsedAlert.info) {
-    for (const area of inf.areas) {
-      for (const g of area.geocodes) {
-        if (String(g.value || '').includes(zona)) return true;
+// Dado un aviso ya parseado CON AREAS, detecta si contiene la zona.
+// Aquí solo para matching interno; en la salida pública NO incluimos areas.
+function alertHasZonaByGeocode_WITH_AREAS(parsedAlert, zona) {
+  const infos = asArray(parsedAlert.info);
+  for (const inf of infos) {
+    const areas = asArray(inf.areas || []);
+    for (const area of areas) {
+      const geocodes = asArray(area.geocodes || area.geocode || []);
+      for (const g of geocodes) {
+        const value = g?.value ?? g?.['#text'] ?? '';
+        if (String(value).includes(zona)) return true;
       }
     }
   }
@@ -250,8 +237,8 @@ function alertHasZonaByGeocode(parsedAlert, zona) {
 
 // ========================= REFRESCO DESDE AEMET (por área) =========================
 //
-// Descarga el “ultimoelaborado” del área, extrae TAR/XML, parsea CAP, y
-// ACUMULA en cacheZona todos los avisos de cada zona detectada.
+// Descarga el “ultimoelaborado” del área, extrae TAR/XML, y ACUMULA en cacheZona
+// todos los avisos de cada zona detectada, SIN metadatos/areas/raw_xml en el payload final.
 //
 async function refreshArea(area) {
   if (!AEMET_API_KEY) throw new Error('Falta AEMET_API_KEY en el entorno.');
@@ -260,7 +247,6 @@ async function refreshArea(area) {
   // 1) HATEOAS (datos/metadatos)
   const cat = await tryFetchJSON(urlCatalogo);
   const urlDatos = cat?.datos;
-  const urlMetadatos = cat?.metadatos || null;
   if (!urlDatos) throw new Error('Respuesta de AEMET sin "datos".');
 
   // 2) Descargar TAR/XML
@@ -275,29 +261,21 @@ async function refreshArea(area) {
     isTar = false;
   }
 
-  // 4) Recopilar ficheros + construir/ACUMULAR payload por zona
+  // 4) Recopilar ficheros + construir/ACUMULAR payload por zona (sin metadatos/areas/raw_xml)
   const ficheros = [];
   const nowIso = new Date().toISOString();
   const zonasActualizadas = new Set();
-  let metadatos = null;
 
-  // Auxiliares de acumulación/deduplicado
+  // Auxiliar de deduplicado por 'file + header.identifier'
   const dedupKey = (a) => `${a.file}::${a.header?.identifier || ''}`;
 
   // Inserta/Acumula en cacheZona para una zona concreta
-  function upsertZona(zona, nuevosAvisos, fileList) {
+  function upsertZona(zona, nuevosAvisos, fileList, ctxQuery) {
     if (!zona || nuevosAvisos.length === 0) return;
 
     const newPayload = {
-      query: {
-        zona,
-        area,
-        url_catalogo: urlCatalogo,
-        url_datos: urlDatos,
-        url_metadatos: urlMetadatos,
-        last_success_at: nowIso
-      },
-      metadatos: null, // se rellenará al final (una vez por área)
+      query: { ...ctxQuery, zona },
+      // SIN metadatos en la salida pública
       ficheros: fileList,
       avisos: nuevosAvisos
     };
@@ -321,7 +299,6 @@ async function refreshArea(area) {
       const mergedPayload = {
         ...existing.payload,
         query: { ...existing.payload.query, ...newPayload.query },
-        metadatos: existing.payload.metadatos ?? null,
         ficheros: Array.from(filesByName.values()),
         avisos: Array.from(avisosByKey.values())
       };
@@ -333,6 +310,14 @@ async function refreshArea(area) {
 
     zonasActualizadas.add(zona);
   }
+
+  const baseQuery = {
+    area,
+    url_catalogo: urlCatalogo,
+    url_datos: urlDatos,
+    url_metadatos: cat?.metadatos || null, // se mantiene para trazabilidad en query
+    last_success_at: nowIso
+  };
 
   if (isTar) {
     // Guardamos listado de ficheros del TAR (para trazabilidad)
@@ -346,56 +331,72 @@ async function refreshArea(area) {
 
       const fileName = e.name;
       const xml = decodeToString(e.buffer);
-      const parsedList = parseCapXml(xml);
 
-      // Detectar posibles zonas: por nombre y por geocódigo
+      // Para detectar pertenencia a zona necesitamos ÁREAS durante el matching,
+      // así que parseamos UNA VEZ con áreas (rápido) SOLO para decidir si incluye la zona.
+      const parsedWithAreas = parseCap_FOR_MATCHING(xml);
+
+      // También parseamos SIN áreas para la salida pública (ligera)
+      const parsedWithoutAreas = parseCapXmlWithoutAreas(xml);
+
+      // Detectar posibles zonas candidatas por nombre y geocódigos
       const posiblesZonas = new Set();
       const nameMatches = fileName.match(/\d{6}/g) || [];
       nameMatches.forEach(z => posiblesZonas.add(z));
 
-      for (const pa of parsedList) {
-        for (const inf of pa.info) {
-          for (const area of inf.areas) {
-            for (const g of area.geocodes) {
-              const ms = String(g.value || '').match(/\d{6}/g) || [];
+      for (const pa of parsedWithAreas) {
+        if (!pa) continue;
+        // Recorremos áreas/geocodes para extraer zonas de 6 dígitos
+        for (const inf of asArray(pa.info)) {
+          for (const areaObj of asArray(inf.areas || [])) {
+            for (const g of asArray(areaObj.geocodes || areaObj.geocode || [])) {
+              const ms = String(g?.value ?? g?.['#text'] ?? '').match(/\d{6}/g) || [];
               ms.forEach(z => posiblesZonas.add(z));
             }
           }
         }
       }
 
-      // Para cada zona detectada, recolectamos los avisos que la contienen
+      // Para cada zona detectada, recolectamos avisos que la contengan
       for (const zona of posiblesZonas) {
         const avisos = [];
         const matchedByName = fileMatchesZonaByName(fileName, zona);
 
-        for (const pa of parsedList) {
-          const matchedGeo = alertHasZonaByGeocode(pa, zona);
+        // Recorremos los avisos parseados SIN áreas (para la salida),
+        // pero validando su pertenencia con la versión CON áreas.
+        for (let i = 0; i < parsedWithoutAreas.length; i++) {
+          const aSinAreas = parsedWithoutAreas[i];
+          const aConAreas = parsedWithAreas[i]; // índice homólogo
+
+          // ¿Este aviso contiene la zona? (por nombre de fichero o por geocódigo)
+          const matchedGeo = aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false;
           if (matchedByName || matchedGeo) {
-            // Adjuntamos el XML bruto y la referencia al fichero origen
-            avisos.push({ file: fileName, ...pa, raw_xml: xml });
+            // Adjuntamos referencia al fichero origen (sin raw_xml)
+            avisos.push({ file: fileName, ...aSinAreas });
           }
         }
 
-        // ACUMULAR en caché (no sobrescribir) para esta zona
         if (avisos.length > 0) {
-          upsertZona(zona, avisos, ficheros);
+          upsertZona(zona, avisos, ficheros, baseQuery);
         }
       }
     }
   } else {
     // XML directo (sin TAR)
     const xml = decodeToString(dataBuf);
-    const parsedList = parseCapXml(xml);
+
+    // Parseo doble: con áreas (solo matching) y sin áreas (salida ligera)
+    const parsedWithAreas = parseCap_FOR_MATCHING(xml);
+    const parsedWithoutAreas = parseCapXmlWithoutAreas(xml);
 
     const ficherosXml = [{ name: 'datos.xml', size: xml.length, sha1: null, matched_by: 'geocode' }];
 
     const posiblesZonas = new Set();
-    for (const pa of parsedList) {
-      for (const inf of pa.info) {
-        for (const area of inf.areas) {
-          for (const g of area.geocodes) {
-            const ms = String(g.value || '').match(/\d{6}/g) || [];
+    for (const pa of parsedWithAreas) {
+      for (const inf of asArray(pa.info)) {
+        for (const areaObj of asArray(inf.areas || [])) {
+          for (const g of asArray(areaObj.geocodes || areaObj.geocode || [])) {
+            const ms = String(g?.value ?? g?.['#text'] ?? '').match(/\d{6}/g) || [];
             ms.forEach(z => posiblesZonas.add(z));
           }
         }
@@ -404,28 +405,76 @@ async function refreshArea(area) {
 
     for (const zona of posiblesZonas) {
       const avisos = [];
-      for (const pa of parsedList) {
-        const matched = alertHasZonaByGeocode(pa, zona);
-        if (matched) avisos.push({ file: 'datos.xml', ...pa, raw_xml: xml, matched_by: 'geocode' });
+      for (let i = 0; i < parsedWithoutAreas.length; i++) {
+        const aSinAreas = parsedWithoutAreas[i];
+        const aConAreas = parsedWithAreas[i];
+        const matched = aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false;
+        if (matched) avisos.push({ file: 'datos.xml', ...aSinAreas });
       }
       if (avisos.length > 0) {
-        upsertZona(zona, avisos, ficherosXml);
+        upsertZona(zona, avisos, ficherosXml, baseQuery);
       }
-    }
-  }
-
-  // 5) Metadatos (una vez por área) y propagar a zonas actualizadas
-  if (cat?.metadatos) {
-    try { metadatos = await fetchJSONSmart(cat.metadatos); } catch { /* opcional */ }
-  }
-  if (metadatos) {
-    for (const zona of zonasActualizadas) {
-      const entry = cacheZona.get(zona);
-      if (entry?.payload) entry.payload.metadatos = metadatos;
     }
   }
 
   return { area, zonasActualizadas: Array.from(zonasActualizadas), filesCount: isTar ? entries.length : 1 };
+}
+
+// ----- Parser auxiliar SOLO para matching (incluye areas), no se expone en salida pública -----
+function parseCap_FOR_MATCHING(xmlText) {
+  const p2 = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '@_',
+    textNodeName: '#text',
+    trimValues: true,
+  });
+  const root = p2.parse(xmlText);
+  const alerts = asArray(root?.alert || root?.['cap:alert']);
+  // Mantener info.areas y geocodes tal cual para verificar zona
+  return alerts.map((alert) => ({
+    header: {
+      identifier: alert?.identifier ?? null,
+      sender: alert?.sender ?? null,
+      sent: alert?.sent ?? null,
+      status: alert?.status ?? null,
+      msgType: alert?.msgType ?? null,
+      scope: alert?.scope ?? null,
+    },
+    info: asArray(alert?.info).map((info) => ({
+      language: info?.language ?? null,
+      category: asArray(info?.category).map(String),
+      event: info?.event ?? null,
+      responseType: asArray(info?.responseType).map(String),
+      urgency: info?.urgency ?? null,
+      severity: info?.severity ?? null,
+      certainty: info?.certainty ?? null,
+      effective: info?.effective ?? null,
+      onset: info?.onset ?? null,
+      expires: info?.expires ?? null,
+      headline: info?.headline ?? null,
+      description: info?.description ?? null,
+      instruction: info?.instruction ?? null,
+      web: info?.web ?? null,
+      contact: info?.contact ?? null,
+      parameters: asArray(info?.parameter).map((p) => ({
+        valueName: p?.valueName ?? p?.['@_valueName'] ?? p?.name ?? null,
+        value: p?.value ?? p?.['#text'] ?? null,
+      })),
+      eventCode: asArray(info?.eventCode).map((ec) => ({
+        name: ec?.name ?? ec?.['@_name'] ?? null,
+        value: ec?.value ?? ec?.['#text'] ?? null,
+      })),
+      // Aquí sí conservamos areas para poder detectar la zona.
+      areas: asArray(info?.area).map((a) => ({
+        areaDesc: a?.areaDesc ?? null,
+        polygons: asArray(a?.polygon).map(String),
+        geocodes: asArray(a?.geocode).map((g) => ({
+          valueName: g?.valueName ?? g?.['@_valueName'] ?? null,
+          value: g?.value ?? g?.['#text'] ?? null,
+        })),
+      })),
+    })),
+  }));
 }
 
 // ========================= AUTH PARA ENDPOINTS ADMIN =========================
@@ -486,8 +535,7 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
       try {
         const r = await refreshArea(a2);
         results.push({ area: a2, ok: true, zonas: r.zonasActualizadas.length });
-        // Pequeño respiro para no saturar AEMET
-        await sleep(250);
+        await sleep(250); // pequeño respiro para no saturar AEMET
       } catch (e) {
         results.push({ area: a2, ok: false, error: String(e.message || e) });
       }
@@ -499,6 +547,8 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
 });
 
 // --- PÚBLICO: consulta por zona (GET /avisos?zona=XXXXXX) ---
+// Devuelve estructura compatible con el primer servicio: { query, ficheros, avisos, stale, cache }
+// (SIN metadatos, SIN areas en info, SIN raw_xml)
 app.get('/avisos', async (req, res) => {
   try {
     const zona = String(req.query.zona || '').trim();
@@ -512,7 +562,7 @@ app.get('/avisos', async (req, res) => {
 
     const expired = isExpired(entry);
     const payload = {
-      ...entry.payload,
+      ...entry.payload, // { query, ficheros, avisos }
       stale: Boolean(entry.stale || expired),
       cache: {
         fetched_at: new Date(entry.fetchedAt).toISOString(),
