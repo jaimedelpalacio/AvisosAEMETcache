@@ -655,6 +655,32 @@ app.get('/avisos', async (req, res) => {
   }
 });
 
+
+// Nuevo endpoint para ver el estado de cada área en caché
+app.get('/areas/status', (req, res) => {
+  try {
+    // cache es el objeto que ya usa el microservicio para guardar datos por área
+    const status = Object.keys(cache).map(area => {
+      const entry = cache[area];
+      return {
+        area,
+        last_success_at: entry.last_success_at || null,
+        fetched_at: entry.cache?.fetched_at || null,
+        ttl_seconds: entry.cache?.ttl_seconds || null,
+        expired: entry.cache?.expired || false
+      };
+    });
+
+    res.json(status);
+  } catch (error) {
+    console.error('Error generando /areas/status', error);
+    res.status(500).json({ error: 'No se pudo generar el estado de las áreas' });
+  }
+});
+
+
+
 app.listen(PORT, () => {
   console.log(`AEMET avisos por zona – caché escuchando en :${PORT}`);
 });
+
