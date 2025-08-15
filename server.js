@@ -6,12 +6,18 @@
 //      que solo lee de caché y NUNCA llama a AEMET.
 //   2) Para cada zona (6 dígitos), ACUMULAR TODOS los avisos presentes en el TAR/XML “ultimoelaborado”,
 //      sin perder ninguno por sobrescritura, con deduplicación por (file + header.identifier).
-//   3) La respuesta pública debe mantener la ESTRUCTURA del primer servicio (compatible con MT Neo):
+//   3) La respuesta pública mantiene la ESTRUCTURA original (compatible con MT Neo):
 //        { query, ficheros, avisos, stale, cache }
 //      PERO eliminando campos pesados:
 //        - NO devolver `metadatos`
 //        - NO incluir `areas` dentro de `info`
 //        - NO incluir `raw_xml`
+//
+//   4) Cambios pedidos (este archivo ya los integra):
+//      - NO procesar ficheros “generales CCAA” (patrón AFAZ<AREA>VV…)
+//      - EXCLUIR avisos de nivel VERDE (solo amarillo/naranja/rojo)
+//      - EXCLUIR avisos genéricos CCAA por titular (“… CCAA”)
+//      - Opcional: en `ficheros`, listar solo los que aportaron avisos tras filtros
 // --------------------------------------------------------------------------------------------------------
 
 import express from 'express';
@@ -187,7 +193,6 @@ function parseCapXmlWithoutAreas(xmlText) {
       }));
 
       // ⚠️ Importante: NO devolvemos "areas" para aligerar la respuesta.
-      // (La pertenencia a zona ya la verificamos antes vía nombre de fichero o geocódigo.)
       return {
         language: info?.language ?? null,
         category,
@@ -235,10 +240,59 @@ function alertHasZonaByGeocode_WITH_AREAS(parsedAlert, zona) {
   return false;
 }
 
+// ========================= FILTROS PERSONALIZADOS =========================
+//
+// Requisitos del usuario: excluir
+//  - Ficheros “generales CCAA” (patrón AFAZ<AREA>VV…)
+//  - Avisos de nivel VERDE
+//  - Avisos genéricos CCAA por titular (“… CCAA”)
+// --------------------------------------------------------------------------
+
+/** Heurística para identificar ficheros agregados de CCAA (no se procesan) */
+function isGenericCCAAFileName(fileName) {
+  // AFAZ<AREA>VV... => ficheros agregados de Comunidad Autónoma
+  return /AFAZ\d{2}VV/i.test(fileName || '');
+}
+
+/** Devuelve el nivel de Meteoalerta a partir de info.parameters */
+function getAemetLevelFromInfo(info) {
+  const params = Array.isArray(info?.parameters) ? info.parameters : [];
+  for (const p of params) {
+    const name = String(p?.valueName || '').toLowerCase();
+    if (name === 'aemet-meteoalerta nivel') {
+      return String(p?.value || '').toLowerCase(); // 'verde' | 'amarillo' | 'naranja' | 'rojo'
+    }
+  }
+  return null;
+}
+
+/** Verdadero si ALGUNA info es no-verde (amarillo/naranja/rojo) o la severidad CAP es >= Moderate */
+function alertHasNonGreenLevel(infos) {
+  for (const i of (Array.isArray(infos) ? infos : [])) {
+    const lvl = getAemetLevelFromInfo(i);
+    if (lvl && lvl !== 'verde') return true;
+  }
+  for (const i of (Array.isArray(infos) ? infos : [])) {
+    const sev = String(i?.severity || '').toLowerCase(); // Minor, Moderate, Severe, Extreme
+    if (sev === 'moderate' || sev === 'severe' || sev === 'extreme') return true;
+  }
+  return false;
+}
+
+/** Verdadero si el titular parece genérico de CCAA */
+function alertLooksGenericCCAA(infos) {
+  for (const i of (Array.isArray(infos) ? infos : [])) {
+    const hl = String(i?.headline || '').toLowerCase();
+    if (hl.includes('ccaa')) return true; // p.ej. “Aviso ... CCAA”
+  }
+  return false;
+}
+
 // ========================= REFRESCO DESDE AEMET (por área) =========================
 //
 // Descarga el “ultimoelaborado” del área, extrae TAR/XML, y ACUMULA en cacheZona
 // todos los avisos de cada zona detectada, SIN metadatos/areas/raw_xml en el payload final.
+// Aplica filtros personalizados (no VV, no verdes, no genéricos CCAA).
 //
 async function refreshArea(area) {
   if (!AEMET_API_KEY) throw new Error('Falta AEMET_API_KEY en el entorno.');
@@ -264,7 +318,9 @@ async function refreshArea(area) {
   // 4) Recopilar ficheros + construir/ACUMULAR payload por zona (sin metadatos/areas/raw_xml)
   const ficheros = [];
   const nowIso = new Date().toISOString();
-  const zonasActualizadas = new Set();
+
+  // 🔎 Para limpiar `ficheros`: guardamos por zona qué ficheros han aportado avisos tras filtros
+  const usedFilesByZona = new Map(); // zona -> Set(fileName)
 
   // Auxiliar de deduplicado por 'file + header.identifier'
   const dedupKey = (a) => `${a.file}::${a.header?.identifier || ''}`;
@@ -273,10 +329,14 @@ async function refreshArea(area) {
   function upsertZona(zona, nuevosAvisos, fileList, ctxQuery) {
     if (!zona || nuevosAvisos.length === 0) return;
 
+    // Limpiar `ficheros`: solo los que realmente aportaron avisos a esta zona en esta pasada
+    const usedSet = usedFilesByZona.get(zona) || new Set();
+    const ficherosFiltrados = fileList.filter(f => usedSet.has(f.name));
+
     const newPayload = {
       query: { ...ctxQuery, zona },
       // SIN metadatos en la salida pública
-      ficheros: fileList,
+      ficheros: ficherosFiltrados,
       avisos: nuevosAvisos
     };
 
@@ -307,8 +367,6 @@ async function refreshArea(area) {
     } else {
       cacheZona.set(zona, { payload: newPayload, fetchedAt: nowMs(), stale: false });
     }
-
-    zonasActualizadas.add(zona);
   }
 
   const baseQuery = {
@@ -320,7 +378,7 @@ async function refreshArea(area) {
   };
 
   if (isTar) {
-    // Guardamos listado de ficheros del TAR (para trazabilidad)
+    // Guardamos listado de ficheros del TAR (para trazabilidad), pero filtraremos más tarde
     for (const ent of entries) {
       ficheros.push({ name: ent.name, size: ent.size, sha1: ent.sha1, matched_by: null });
     }
@@ -329,14 +387,14 @@ async function refreshArea(area) {
     for (const e of entries) {
       if (!e.name.toLowerCase().endsWith('.xml')) continue;
 
+      // ⛔️ Saltar ficheros generales CCAA (VV) directamente (ahorro CPU/I/O)
+      if (isGenericCCAAFileName(e.name)) continue;
+
       const fileName = e.name;
       const xml = decodeToString(e.buffer);
 
-      // Para detectar pertenencia a zona necesitamos ÁREAS durante el matching,
-      // así que parseamos UNA VEZ con áreas (rápido) SOLO para decidir si incluye la zona.
+      // Parseo doble: con áreas (solo matching) y sin áreas (salida ligera)
       const parsedWithAreas = parseCap_FOR_MATCHING(xml);
-
-      // También parseamos SIN áreas para la salida pública (ligera)
       const parsedWithoutAreas = parseCapXmlWithoutAreas(xml);
 
       // Detectar posibles zonas candidatas por nombre y geocódigos
@@ -346,7 +404,6 @@ async function refreshArea(area) {
 
       for (const pa of parsedWithAreas) {
         if (!pa) continue;
-        // Recorremos áreas/geocodes para extraer zonas de 6 dígitos
         for (const inf of asArray(pa.info)) {
           for (const areaObj of asArray(inf.areas || [])) {
             for (const g of asArray(areaObj.geocodes || areaObj.geocode || [])) {
@@ -357,23 +414,29 @@ async function refreshArea(area) {
         }
       }
 
-      // Para cada zona detectada, recolectamos avisos que la contengan
+      // Para cada zona detectada, recolectamos avisos que la contengan (y pasen filtros)
       for (const zona of posiblesZonas) {
         const avisos = [];
         const matchedByName = fileMatchesZonaByName(fileName, zona);
 
-        // Recorremos los avisos parseados SIN áreas (para la salida),
-        // pero validando su pertenencia con la versión CON áreas.
         for (let i = 0; i < parsedWithoutAreas.length; i++) {
           const aSinAreas = parsedWithoutAreas[i];
           const aConAreas = parsedWithAreas[i]; // índice homólogo
 
           // ¿Este aviso contiene la zona? (por nombre de fichero o por geocódigo)
           const matchedGeo = aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false;
-          if (matchedByName || matchedGeo) {
-            // Adjuntamos referencia al fichero origen (sin raw_xml)
-            avisos.push({ file: fileName, ...aSinAreas });
-          }
+          if (!(matchedByName || matchedGeo)) continue;
+
+          // ⛔️ Filtrado: excluir VERDE
+          if (!alertHasNonGreenLevel(aSinAreas?.info)) continue;
+
+          // ⛔️ Filtrado: excluir genéricos CCAA por titular
+          if (alertLooksGenericCCAA(aSinAreas?.info)) continue;
+
+          // ✅ Pasa filtros → añadimos aviso y marcamos fichero como usado para esta zona
+          avisos.push({ file: fileName, ...aSinAreas });
+          if (!usedFilesByZona.has(zona)) usedFilesByZona.set(zona, new Set());
+          usedFilesByZona.get(zona).add(fileName);
         }
 
         if (avisos.length > 0) {
@@ -389,7 +452,9 @@ async function refreshArea(area) {
     const parsedWithAreas = parseCap_FOR_MATCHING(xml);
     const parsedWithoutAreas = parseCapXmlWithoutAreas(xml);
 
-    const ficherosXml = [{ name: 'datos.xml', size: xml.length, sha1: null, matched_by: 'geocode' }];
+    // Como no hay nombre de fichero real, usamos un nombre lógico
+    const fileName = 'datos.xml';
+    const ficherosXml = [{ name: fileName, size: xml.length, sha1: null, matched_by: 'geocode' }];
 
     const posiblesZonas = new Set();
     for (const pa of parsedWithAreas) {
@@ -409,7 +474,18 @@ async function refreshArea(area) {
         const aSinAreas = parsedWithoutAreas[i];
         const aConAreas = parsedWithAreas[i];
         const matched = aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false;
-        if (matched) avisos.push({ file: 'datos.xml', ...aSinAreas });
+        if (!matched) continue;
+
+        // ⛔️ Excluir VERDE
+        if (!alertHasNonGreenLevel(aSinAreas?.info)) continue;
+
+        // ⛔️ Excluir genéricos CCAA
+        if (alertLooksGenericCCAA(aSinAreas?.info)) continue;
+
+        // ✅ Pasa filtros
+        avisos.push({ file: fileName, ...aSinAreas });
+        if (!usedFilesByZona.has(zona)) usedFilesByZona.set(zona, new Set());
+        usedFilesByZona.get(zona).add(fileName);
       }
       if (avisos.length > 0) {
         upsertZona(zona, avisos, ficherosXml, baseQuery);
@@ -417,7 +493,8 @@ async function refreshArea(area) {
     }
   }
 
-  return { area, zonasActualizadas: Array.from(zonasActualizadas), filesCount: isTar ? entries.length : 1 };
+  // Nota: `ficheros` ya se depura por zona dentro de upsertZona usando usedFilesByZona.
+  return { area, filesCount: isTar ? (entries?.length || 0) : 1 };
 }
 
 // ----- Parser auxiliar SOLO para matching (incluye areas), no se expone en salida pública -----
@@ -534,7 +611,7 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
       const a2 = String(a).padStart(2, '0');
       try {
         const r = await refreshArea(a2);
-        results.push({ area: a2, ok: true, zonas: r.zonasActualizadas.length });
+        results.push({ area: a2, ok: true, filesCount: r.filesCount });
         await sleep(250); // pequeño respiro para no saturar AEMET
       } catch (e) {
         results.push({ area: a2, ok: false, error: String(e.message || e) });
