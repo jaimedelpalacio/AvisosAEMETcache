@@ -13,11 +13,14 @@
 //        - NO incluir `areas` dentro de `info`
 //        - NO incluir `raw_xml`
 //
-//   4) Cambios pedidos (este archivo ya los integra):
+//   4) Filtros ya integrados:
 //      - NO procesar ficheros “generales CCAA” (patrón AFAZ<AREA>VV…)
 //      - EXCLUIR avisos de nivel VERDE (solo amarillo/naranja/rojo)
 //      - EXCLUIR avisos genéricos CCAA por titular (“… CCAA”)
-//      - Opcional: en `ficheros`, listar solo los que aportaron avisos tras filtros
+//
+//   5) CAMBIO NUEVO (este archivo lo incluye):
+//      - Extraer zona del nombre de fichero SOLO si aparece como AFAZ(\d{6})
+//      - Filtrar SIEMPRE las posibles zonas para que empiecen por el código del área (2 dígitos)
 // --------------------------------------------------------------------------------------------------------
 
 import express from 'express';
@@ -38,16 +41,7 @@ const AREAS = (process.env.AREAS || '').split(',').map(s => s.trim()).filter(Boo
 app.use(express.json({ limit: '4mb' }));
 
 // ========================= CACHÉ EN MEMORIA (por zona) =========================
-//
-// Estructura de cada entrada:
-//   {
-//     payload: { query, ficheros[], avisos[] },   // (SIN metadatos)
-//     fetchedAt: <ms epoch>,
-//     stale: boolean
-//   }
-// Consideramos expirada si la edad > CACHE_TTL_SECONDS.
-//
-const cacheZona = new Map(); // key: '614101' -> entry
+const cacheZona = new Map(); // key: '614101' -> { payload, fetchedAt, stale }
 
 function nowMs() { return Date.now(); }
 function isExpired(entry) {
@@ -159,11 +153,7 @@ const parser = new XMLParser({
 
 function asArray(x) { return Array.isArray(x) ? x : x == null ? [] : [x]; }
 
-/**
- * Parsea un XML CAP y lo normaliza en un array de objetos:
- *  { header, info[] }
- * Donde cada info NO incluye "areas" (se eliminan) para aligerar payload.
- */
+/** Parsea un XML CAP y lo normaliza sin `areas` en `info` para aligerar payload */
 function parseCapXmlWithoutAreas(xmlText) {
   const root = parser.parse(xmlText);
   const alerts = asArray(root?.alert || root?.['cap:alert']);
@@ -192,7 +182,7 @@ function parseCapXmlWithoutAreas(xmlText) {
         value: ec?.value ?? ec?.['#text'] ?? null,
       }));
 
-      // ⚠️ Importante: NO devolvemos "areas" para aligerar la respuesta.
+      // ⚠️ NO devolvemos "areas" para aligerar respuesta pública
       return {
         language: info?.language ?? null,
         category,
@@ -211,7 +201,6 @@ function parseCapXmlWithoutAreas(xmlText) {
         contact: info?.contact ?? null,
         parameters,
         eventCode
-        // sin areas
       };
     });
 
@@ -220,11 +209,9 @@ function parseCapXmlWithoutAreas(xmlText) {
 }
 
 // ========================= MATCH POR ZONA =========================
-
 function fileMatchesZonaByName(fileName, zona) { return fileName.includes(zona); }
 
-// Dado un aviso ya parseado CON AREAS, detecta si contiene la zona.
-// Aquí solo para matching interno; en la salida pública NO incluimos areas.
+// Dado un aviso CON AREAS, detecta si contiene la zona (para matching interno)
 function alertHasZonaByGeocode_WITH_AREAS(parsedAlert, zona) {
   const infos = asArray(parsedAlert.info);
   for (const inf of infos) {
@@ -241,20 +228,11 @@ function alertHasZonaByGeocode_WITH_AREAS(parsedAlert, zona) {
 }
 
 // ========================= FILTROS PERSONALIZADOS =========================
-//
-// Requisitos del usuario: excluir
-//  - Ficheros “generales CCAA” (patrón AFAZ<AREA>VV…)
-//  - Avisos de nivel VERDE
-//  - Avisos genéricos CCAA por titular (“… CCAA”)
-// --------------------------------------------------------------------------
-
-/** Heurística para identificar ficheros agregados de CCAA (no se procesan) */
 function isGenericCCAAFileName(fileName) {
   // AFAZ<AREA>VV... => ficheros agregados de Comunidad Autónoma
   return /AFAZ\d{2}VV/i.test(fileName || '');
 }
 
-/** Devuelve el nivel de Meteoalerta a partir de info.parameters */
 function getAemetLevelFromInfo(info) {
   const params = Array.isArray(info?.parameters) ? info.parameters : [];
   for (const p of params) {
@@ -266,7 +244,6 @@ function getAemetLevelFromInfo(info) {
   return null;
 }
 
-/** Verdadero si ALGUNA info es no-verde (amarillo/naranja/rojo) o la severidad CAP es >= Moderate */
 function alertHasNonGreenLevel(infos) {
   for (const i of (Array.isArray(infos) ? infos : [])) {
     const lvl = getAemetLevelFromInfo(i);
@@ -279,7 +256,6 @@ function alertHasNonGreenLevel(infos) {
   return false;
 }
 
-/** Verdadero si el titular parece genérico de CCAA */
 function alertLooksGenericCCAA(infos) {
   for (const i of (Array.isArray(infos) ? infos : [])) {
     const hl = String(i?.headline || '').toLowerCase();
@@ -289,11 +265,6 @@ function alertLooksGenericCCAA(infos) {
 }
 
 // ========================= REFRESCO DESDE AEMET (por área) =========================
-//
-// Descarga el “ultimoelaborado” del área, extrae TAR/XML, y ACUMULA en cacheZona
-// todos los avisos de cada zona detectada, SIN metadatos/areas/raw_xml en el payload final.
-// Aplica filtros personalizados (no VV, no verdes, no genéricos CCAA).
-//
 async function refreshArea(area) {
   if (!AEMET_API_KEY) throw new Error('Falta AEMET_API_KEY en el entorno.');
   const urlCatalogo = `https://opendata.aemet.es/opendata/api/avisos_cap/ultimoelaborado/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
@@ -335,7 +306,6 @@ async function refreshArea(area) {
 
     const newPayload = {
       query: { ...ctxQuery, zona },
-      // SIN metadatos en la salida pública
       ficheros: ficherosFiltrados,
       avisos: nuevosAvisos
     };
@@ -378,10 +348,13 @@ async function refreshArea(area) {
   };
 
   if (isTar) {
-    // Guardamos listado de ficheros del TAR (para trazabilidad), pero filtraremos más tarde
+    // Guardamos listado de ficheros del TAR (para trazabilidad)
     for (const ent of entries) {
       ficheros.push({ name: ent.name, size: ent.size, sha1: ent.sha1, matched_by: null });
     }
+
+    // ⚙️ Código de área (2 dígitos), lo usamos para filtrar zonas válidas
+    const areaCode = String(area).padStart(2, '0');
 
     // Procesamos cada entrada XML del TAR
     for (const e of entries) {
@@ -397,24 +370,33 @@ async function refreshArea(area) {
       const parsedWithAreas = parseCap_FOR_MATCHING(xml);
       const parsedWithoutAreas = parseCapXmlWithoutAreas(xml);
 
-      // Detectar posibles zonas candidatas por nombre y geocódigos
+      // Detectar posibles zonas candidatas (nombre de fichero + geocódigos)
       const posiblesZonas = new Set();
-      const nameMatches = fileName.match(/\d{6}/g) || [];
-      nameMatches.forEach(z => posiblesZonas.add(z));
 
+      // ✅ EXTRAER zona SOLO si aparece como AFAZ(\d{6}) en el nombre
+      //    Ej.: ...AFAZ614102ATTA...
+      const m = fileName.match(/AFAZ(\d{6})/i);
+      if (m && m[1].startsWith(areaCode)) {
+        posiblesZonas.add(m[1]);
+      }
+
+      // ✅ Añadir zonas desde geocódigos, SOLO si empiezan por el código de área
       for (const pa of parsedWithAreas) {
         if (!pa) continue;
         for (const inf of asArray(pa.info)) {
           for (const areaObj of asArray(inf.areas || [])) {
             for (const g of asArray(areaObj.geocodes || areaObj.geocode || [])) {
-              const ms = String(g?.value ?? g?.['#text'] ?? '').match(/\d{6}/g) || [];
-              ms.forEach(z => posiblesZonas.add(z));
+              const val = g?.value ?? g?.['#text'] ?? '';
+              const matches = String(val).match(/\b\d{6}\b/g) || [];
+              for (const z of matches) {
+                if (String(z).startsWith(areaCode)) posiblesZonas.add(String(z));
+              }
             }
           }
         }
       }
 
-      // Para cada zona detectada, recolectamos avisos que la contengan (y pasen filtros)
+      // ✅ Iteramos SOLO por zonas compatibles con el área
       for (const zona of posiblesZonas) {
         const avisos = [];
         const matchedByName = fileMatchesZonaByName(fileName, zona);
@@ -427,10 +409,10 @@ async function refreshArea(area) {
           const matchedGeo = aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false;
           if (!(matchedByName || matchedGeo)) continue;
 
-          // ⛔️ Filtrado: excluir VERDE
+          // ⛔️ Excluir VERDE
           if (!alertHasNonGreenLevel(aSinAreas?.info)) continue;
 
-          // ⛔️ Filtrado: excluir genéricos CCAA por titular
+          // ⛔️ Excluir genéricos CCAA
           if (alertLooksGenericCCAA(aSinAreas?.info)) continue;
 
           // ✅ Pasa filtros → añadimos aviso y marcamos fichero como usado para esta zona
@@ -456,13 +438,19 @@ async function refreshArea(area) {
     const fileName = 'datos.xml';
     const ficherosXml = [{ name: fileName, size: xml.length, sha1: null, matched_by: 'geocode' }];
 
+    // ⚙️ Código de área (2 dígitos), para filtrar geocódigos
+    const areaCode = String(area).padStart(2, '0');
+
     const posiblesZonas = new Set();
     for (const pa of parsedWithAreas) {
       for (const inf of asArray(pa.info)) {
         for (const areaObj of asArray(inf.areas || [])) {
           for (const g of asArray(areaObj.geocodes || areaObj.geocode || [])) {
-            const ms = String(g?.value ?? g?.['#text'] ?? '').match(/\d{6}/g) || [];
-            ms.forEach(z => posiblesZonas.add(z));
+            const val = g?.value ?? g?.['#text'] ?? '';
+            const matches = String(val).match(/\b\d{6}\b/g) || [];
+            for (const z of matches) {
+              if (String(z).startsWith(areaCode)) posiblesZonas.add(String(z));
+            }
           }
         }
       }
@@ -624,8 +612,6 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
 });
 
 // --- PÚBLICO: consulta por zona (GET /avisos?zona=XXXXXX) ---
-// Devuelve estructura compatible con el primer servicio: { query, ficheros, avisos, stale, cache }
-// (SIN metadatos, SIN areas en info, SIN raw_xml)
 app.get('/avisos', async (req, res) => {
   try {
     const zona = String(req.query.zona || '').trim();
@@ -655,18 +641,13 @@ app.get('/avisos', async (req, res) => {
   }
 });
 
-
 // --- PÚBLICO: estado por áreas (GET /areas/status[?area=NN][&include_empty=1]) ---
-// Agrupa la caché por zona (cacheZona) en áreas (dos dígitos en query.area) y devuelve métricas.
-// - ?area=NN           → filtra por un área concreta (p.ej. 61)
-// - &include_empty=1   → incluye áreas definidas en AREAS aunque no tengan zonas en caché
 app.get('/areas/status', (req, res) => {
   try {
     const areaFilter = String(req.query.area || '').trim(); // '61', '62', ...
     const includeEmpty = ['1', 'true', 'yes'].includes(String(req.query.include_empty || '').toLowerCase());
 
-    // Agrupamos por área recorriendo la caché por zona
-    // cacheZona: Map<zona_6d, { payload:{ query:{ area, last_success_at, ... } }, fetchedAt, stale }>
+    // Agrupamos por área recorriendo la caché por zona (Map)
     const byArea = new Map();
 
     for (const [zona, entry] of cacheZona.entries()) {
@@ -689,7 +670,6 @@ app.get('/areas/status', (req, res) => {
       rec.zones.add(zona);
       rec.zones_count = rec.zones.size;
 
-      // last_success_at viene de la query que guardamos al refrescar el área
       const lsStr = entry?.payload?.query?.last_success_at || null;
       const ls = lsStr ? new Date(lsStr) : null;
       if (ls) {
@@ -697,7 +677,6 @@ app.get('/areas/status', (req, res) => {
         rec.last_success_at_earliest = !rec.last_success_at_earliest || ls < rec.last_success_at_earliest ? ls : rec.last_success_at_earliest;
       }
 
-      // fetchedAt es cuándo metimos en caché esa zona en este servicio
       const fa = new Date(entry.fetchedAt);
       rec.fetched_at_latest = !rec.fetched_at_latest || fa > rec.fetched_at_latest ? fa : rec.fetched_at_latest;
       rec.fetched_at_earliest = !rec.fetched_at_earliest || fa < rec.fetched_at_earliest ? fa : rec.fetched_at_earliest;
@@ -708,7 +687,6 @@ app.get('/areas/status', (req, res) => {
       byArea.set(area, rec);
     }
 
-    // Si piden include_empty, añadimos áreas configuradas en AREAS que no tengan caché aún
     if (includeEmpty) {
       for (const a of AREAS) {
         const aa = String(a).padStart(2, '0');
@@ -722,19 +700,18 @@ app.get('/areas/status', (req, res) => {
             last_success_at_earliest: null,
             fetched_at_latest: null,
             fetched_at_earliest: null,
-            expired_any: null,  // desconocido (no hay caché)
+            expired_any: null,
             expired_all: null
           });
         }
       }
     }
 
-    // Formateamos salida
     const out = Array.from(byArea.values()).map(r => ({
       area: r.area,
       zones_count: r.zones_count,
       sample_zones: Array.from(r.zones).slice(0, 5),
-      ttl_seconds: CACHE_TTL_SECONDS, // del entorno
+      ttl_seconds: CACHE_TTL_SECONDS,
       last_success_at_latest: r.last_success_at_latest ? r.last_success_at_latest.toISOString() : null,
       last_success_at_earliest: r.last_success_at_earliest ? r.last_success_at_earliest.toISOString() : null,
       fetched_at_latest: r.fetched_at_latest ? r.fetched_at_latest.toISOString() : null,
@@ -743,20 +720,13 @@ app.get('/areas/status', (req, res) => {
       expired_all: r.expired_all
     }));
 
-    // Orden por área ascendente
     out.sort((a, b) => a.area.localeCompare(b.area));
-
     res.json({ ok: true, areas: out });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-
-
-
 app.listen(PORT, () => {
   console.log(`AEMET avisos por zona – caché escuchando en :${PORT}`);
 });
-
-
