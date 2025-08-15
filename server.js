@@ -1,11 +1,12 @@
 // server.js
-// Microservicio AEMET: refresco por CRON (admin) y consulta por zona (solo caché)
-// ---------------------------------------------------------------------------------
+// Microservicio AEMET – caché por zona con refresco vía cron (admin) y lectura pública sin llamadas a AEMET
+// --------------------------------------------------------------------------------------------------------
 // Objetivo:
-//  - Separar la captura desde AEMET (invocada por un cron de Render a /admin/*)
-//    de la consulta desde MT Neo (/avisos?zona=XXXXXX), que NO toca AEMET.
-//  - Mantener parseo CAP, robustez y trazas mínimas.
-// ---------------------------------------------------------------------------------
+//   - Separar la CAPTURA desde AEMET (vía /admin/*, la invoca el cron de Render) de la CONSULTA pública (/avisos),
+//     que solo lee de caché y NUNCA habla con AEMET.
+//   - Acumular todos los avisos de una misma zona presentes en el TAR/XML del “ultimoelaborado” (sin sobrescribir).
+//   - Deduplicar por (file + header.identifier) para evitar entradas repetidas.
+// --------------------------------------------------------------------------------------------------------
 
 import express from 'express';
 import { fetch } from 'undici';
@@ -16,25 +17,25 @@ import { XMLParser } from 'fast-xml-parser';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const UA = 'MT-Neo-Avisos-Zona/2.0'; // versión interna del UA
+const UA = 'MT-Neo-Avisos-Zona/2.1';
 const AEMET_API_KEY = process.env.AEMET_API_KEY || '';
 const CRON_TOKEN = process.env.RENDER_CRON_TOKEN || '';
 const CACHE_TTL_SECONDS = parseInt(process.env.CACHE_TTL_SECONDS || '1200', 10); // 20 min por defecto
-const AREAS = (process.env.AREAS || '').split(',').map(s => s.trim()).filter(Boolean); // p.ej. "10,11,12,13,..."
+const AREAS = (process.env.AREAS || '').split(',').map(s => s.trim()).filter(Boolean); // p.ej. "61,62,63,..."
 
 app.use(express.json({ limit: '4mb' }));
 
-// =================== Caché en memoria (por zona) ===================
+// ========================= CACHÉ EN MEMORIA (por zona) =========================
 //
 // Estructura de cada entrada:
-// {
-//   payload: { ...respuesta compatible con /avisos... },
-//   fetchedAt: Date (ms),
-//   stale: boolean  (si el refresco marcó degradación),
-// }
-// TTL: si (now - fetchedAt) > CACHE_TTL_SECONDS -> se considera expirada.
+//   {
+//     payload: { query, metadatos, ficheros[], avisos[] },
+//     fetchedAt: <ms epoch>,
+//     stale: boolean
+//   }
+// Consideramos expirada si la edad > CACHE_TTL_SECONDS.
 //
-const cacheZona = new Map(); // key: '614102' -> entry
+const cacheZona = new Map(); // key: '614101' -> entry
 
 function nowMs() { return Date.now(); }
 function isExpired(entry) {
@@ -43,11 +44,11 @@ function isExpired(entry) {
   return ageSec > CACHE_TTL_SECONDS;
 }
 
-// =================== Utilidades generales (reusadas) ===================
+// ========================= UTILIDADES BÁSICAS =========================
 
 function assertZona(z) {
   if (!/^\d{6}$/.test(z || '')) {
-    const e = new Error('Parámetro "zona" inválido. Debe ser 6 dígitos (p.ej. 614102).');
+    const e = new Error('Parámetro "zona" inválido. Debe ser 6 dígitos (p.ej. 614101).');
     e.status = 400;
     throw e;
   }
@@ -69,7 +70,6 @@ async function fetchWithTimeout(url, options = {}, ms = 10000) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Reintentos con backoff
 async function tryFetchJSON(url, headers = {}, { retries = 2, timeoutMs = 10000 } = {}) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
@@ -108,7 +108,7 @@ async function tryFetchBuffer(url, headers = {}, { retries = 2, timeoutMs = 1500
 }
 
 async function fetchJSONSmart(url, headers = {}) {
-  // Decodificación robusta para metadatos
+  // Lectura robusta por si los metadatos vienen con codificación rara
   const r = await fetchWithTimeout(url, { headers: { accept: 'application/json,*/*;q=0.8', 'user-agent': UA, ...headers } }, 10000);
   if (!r.ok) throw new Error(`HTTP ${r.status} en ${url}`);
 
@@ -157,7 +157,7 @@ function decodeToString(b) {
   try { return b.toString('utf8'); } catch { return b.toString('latin1'); }
 }
 
-// =================== Parseo CAP v1.2 ===================
+// ========================= PARSEO CAP v1.2 =========================
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -233,6 +233,8 @@ function parseCapXml(xmlText) {
   });
 }
 
+// ========================= MATCH POR ZONA =========================
+
 function fileMatchesZonaByName(fileName, zona) { return fileName.includes(zona); }
 
 function alertHasZonaByGeocode(parsedAlert, zona) {
@@ -246,13 +248,16 @@ function alertHasZonaByGeocode(parsedAlert, zona) {
   return false;
 }
 
-// =================== Refresco desde AEMET (por área) ===================
-
+// ========================= REFRESCO DESDE AEMET (por área) =========================
+//
+// Descarga el “ultimoelaborado” del área, extrae TAR/XML, parsea CAP, y
+// ACUMULA en cacheZona todos los avisos de cada zona detectada.
+//
 async function refreshArea(area) {
   if (!AEMET_API_KEY) throw new Error('Falta AEMET_API_KEY en el entorno.');
   const urlCatalogo = `https://opendata.aemet.es/opendata/api/avisos_cap/ultimoelaborado/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
 
-  // 1) Obtener enlaces HATEOAS
+  // 1) HATEOAS (datos/metadatos)
   const cat = await tryFetchJSON(urlCatalogo);
   const urlDatos = cat?.datos;
   const urlMetadatos = cat?.metadatos || null;
@@ -261,7 +266,7 @@ async function refreshArea(area) {
   // 2) Descargar TAR/XML
   const dataBuf = await tryFetchBuffer(urlDatos);
 
-  // 3) Extraer (TAR o XML)
+  // 3) Extraer (TAR o XML simple)
   let entries = [];
   let isTar = true;
   try {
@@ -270,33 +275,84 @@ async function refreshArea(area) {
     isTar = false;
   }
 
-  // 4) Recopilar ficheros + avisos por zona detectada
+  // 4) Recopilar ficheros + construir/ACUMULAR payload por zona
   const ficheros = [];
   const nowIso = new Date().toISOString();
   const zonasActualizadas = new Set();
   let metadatos = null;
 
+  // Auxiliares de acumulación/deduplicado
+  const dedupKey = (a) => `${a.file}::${a.header?.identifier || ''}`;
+
+  // Inserta/Acumula en cacheZona para una zona concreta
+  function upsertZona(zona, nuevosAvisos, fileList) {
+    if (!zona || nuevosAvisos.length === 0) return;
+
+    const newPayload = {
+      query: {
+        zona,
+        area,
+        url_catalogo: urlCatalogo,
+        url_datos: urlDatos,
+        url_metadatos: urlMetadatos,
+        last_success_at: nowIso
+      },
+      metadatos: null, // se rellenará al final (una vez por área)
+      ficheros: fileList,
+      avisos: nuevosAvisos
+    };
+
+    const existing = cacheZona.get(zona);
+
+    if (existing?.payload) {
+      // 1) Unir ficheros (dedupe por 'name')
+      const filesByName = new Map();
+      for (const f of [...existing.payload.ficheros, ...newPayload.ficheros]) {
+        if (!filesByName.has(f.name)) filesByName.set(f.name, f);
+      }
+
+      // 2) Unir avisos (dedupe por 'file' + 'identifier')
+      const avisosByKey = new Map();
+      for (const a of [...existing.payload.avisos, ...newPayload.avisos]) {
+        avisosByKey.set(dedupKey(a), a);
+      }
+
+      // 3) Mantener la query más reciente (last_success_at del último fichero)
+      const mergedPayload = {
+        ...existing.payload,
+        query: { ...existing.payload.query, ...newPayload.query },
+        metadatos: existing.payload.metadatos ?? null,
+        ficheros: Array.from(filesByName.values()),
+        avisos: Array.from(avisosByKey.values())
+      };
+
+      cacheZona.set(zona, { payload: mergedPayload, fetchedAt: nowMs(), stale: false });
+    } else {
+      cacheZona.set(zona, { payload: newPayload, fetchedAt: nowMs(), stale: false });
+    }
+
+    zonasActualizadas.add(zona);
+  }
+
   if (isTar) {
+    // Guardamos listado de ficheros del TAR (para trazabilidad)
     for (const ent of entries) {
       ficheros.push({ name: ent.name, size: ent.size, sha1: ent.sha1, matched_by: null });
     }
 
-    // Intento 1: por nombre de fichero (más rápido)
+    // Procesamos cada entrada XML del TAR
     for (const e of entries) {
       if (!e.name.toLowerCase().endsWith('.xml')) continue;
+
       const fileName = e.name;
       const xml = decodeToString(e.buffer);
       const parsedList = parseCapXml(xml);
 
-      // Extraemos todas las zonas presentes (por nombre y por geocódigo)
-      // y construimos payload por cada zona.
+      // Detectar posibles zonas: por nombre y por geocódigo
       const posiblesZonas = new Set();
-
-      // Por nombre: buscar patterns de 6 dígitos típicos en nombre de fichero
       const nameMatches = fileName.match(/\d{6}/g) || [];
       nameMatches.forEach(z => posiblesZonas.add(z));
 
-      // Por geocódigo dentro del XML
       for (const pa of parsedList) {
         for (const inf of pa.info) {
           for (const area of inf.areas) {
@@ -308,42 +364,32 @@ async function refreshArea(area) {
         }
       }
 
-      // Para cada zona detectada, creamos una respuesta autocontenida
+      // Para cada zona detectada, recolectamos los avisos que la contienen
       for (const zona of posiblesZonas) {
         const avisos = [];
-        // Si el nombre de fichero ya incluye la zona, marcamos matched_by
         const matchedByName = fileMatchesZonaByName(fileName, zona);
+
         for (const pa of parsedList) {
           const matchedGeo = alertHasZonaByGeocode(pa, zona);
           if (matchedByName || matchedGeo) {
+            // Adjuntamos el XML bruto y la referencia al fichero origen
             avisos.push({ file: fileName, ...pa, raw_xml: xml });
           }
         }
 
+        // ACUMULAR en caché (no sobrescribir) para esta zona
         if (avisos.length > 0) {
-          const payload = {
-            query: {
-              zona,
-              area,
-              url_catalogo: urlCatalogo,
-              url_datos: urlDatos,
-              url_metadatos: urlMetadatos,
-              last_success_at: nowIso
-            },
-            metadatos: null, // se rellena abajo una vez por área
-            ficheros,
-            avisos
-          };
-          cacheZona.set(zona, { payload, fetchedAt: nowMs(), stale: false });
-          zonasActualizadas.add(zona);
+          upsertZona(zona, avisos, ficheros);
         }
       }
     }
   } else {
-    // XML directo (raro)
+    // XML directo (sin TAR)
     const xml = decodeToString(dataBuf);
     const parsedList = parseCapXml(xml);
-    // Detectar zonas por geocódigo
+
+    const ficherosXml = [{ name: 'datos.xml', size: xml.length, sha1: null, matched_by: 'geocode' }];
+
     const posiblesZonas = new Set();
     for (const pa of parsedList) {
       for (const inf of pa.info) {
@@ -355,7 +401,6 @@ async function refreshArea(area) {
         }
       }
     }
-    const ficheros = [{ name: 'datos.xml', size: xml.length, sha1: null, matched_by: 'geocode' }];
 
     for (const zona of posiblesZonas) {
       const avisos = [];
@@ -364,26 +409,12 @@ async function refreshArea(area) {
         if (matched) avisos.push({ file: 'datos.xml', ...pa, raw_xml: xml, matched_by: 'geocode' });
       }
       if (avisos.length > 0) {
-        const payload = {
-          query: {
-            zona,
-            area,
-            url_catalogo: urlCatalogo,
-            url_datos: urlDatos,
-            url_metadatos: urlMetadatos,
-            last_success_at: nowIso
-          },
-          metadatos: null,
-          ficheros,
-          avisos
-        };
-        cacheZona.set(zona, { payload, fetchedAt: nowMs(), stale: false });
-        zonasActualizadas.add(zona);
+        upsertZona(zona, avisos, ficherosXml);
       }
     }
   }
 
-  // 5) Metadatos (una vez por área)
+  // 5) Metadatos (una vez por área) y propagar a zonas actualizadas
   if (cat?.metadatos) {
     try { metadatos = await fetchJSONSmart(cat.metadatos); } catch { /* opcional */ }
   }
@@ -397,7 +428,7 @@ async function refreshArea(area) {
   return { area, zonasActualizadas: Array.from(zonasActualizadas), filesCount: isTar ? entries.length : 1 };
 }
 
-// =================== Auth para endpoints admin ===================
+// ========================= AUTH PARA ENDPOINTS ADMIN =========================
 
 function requireCronToken(req, res, next) {
   const tok = req.headers['x-cron-token'];
@@ -407,14 +438,14 @@ function requireCronToken(req, res, next) {
   next();
 }
 
-// =================== Endpoints ===================
+// ========================= ENDPOINTS =========================
 
-// Salud básica
+// Estado básico
 app.get('/', (_, res) => {
   res.type('text/plain').send('AEMET avisos por zona – API de caché (cron/admin + consulta)');
 });
 
-// Estado caché + última actualización visible por zona
+// Health: muestra tamaño de caché y zonas de ejemplo
 app.get('/health', (_, res) => {
   const sample = Array.from(cacheZona.keys()).slice(0, 5);
   res.json({
@@ -425,7 +456,7 @@ app.get('/health', (_, res) => {
   });
 });
 
-// --- ADMIN: refrescar un área ---
+// --- ADMIN: refrescar un área concreta (POST /admin/refresh?area=NN) ---
 app.post('/admin/refresh', requireCronToken, async (req, res) => {
   try {
     const area = String(req.query.area || '').trim();
@@ -441,22 +472,24 @@ app.post('/admin/refresh', requireCronToken, async (req, res) => {
   }
 });
 
-// --- ADMIN: refrescar todas las áreas configuradas ---
+// --- ADMIN: refrescar todas las áreas configuradas (POST /admin/refresh-all) ---
 app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
   try {
     const areas = (req.body?.areas && Array.isArray(req.body.areas) ? req.body.areas : AREAS);
     if (!areas || areas.length === 0) {
-      return res.status(400).json({ ok: false, error: 'No hay áreas definidas. Usa body {areas:[..]} o variable AREAS.' });
+      return res.status(400).json({ ok: false, error: 'No hay áreas definidas. Usa body {"areas":[..]} o variable AREAS.' });
     }
+
     const results = [];
     for (const a of areas) {
+      const a2 = String(a).padStart(2, '0');
       try {
-        const r = await refreshArea(String(a).padStart(2, '0'));
-        results.push({ area: a, ok: true, zonas: r.zonasActualizadas.length });
+        const r = await refreshArea(a2);
+        results.push({ area: a2, ok: true, zonas: r.zonasActualizadas.length });
         // Pequeño respiro para no saturar AEMET
         await sleep(250);
       } catch (e) {
-        results.push({ area: a, ok: false, error: String(e.message || e) });
+        results.push({ area: a2, ok: false, error: String(e.message || e) });
       }
     }
     res.json({ ok: true, results });
@@ -465,7 +498,7 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
   }
 });
 
-// --- PÚBLICO: consulta por zona (solo lee de caché) ---
+// --- PÚBLICO: consulta por zona (GET /avisos?zona=XXXXXX) ---
 app.get('/avisos', async (req, res) => {
   try {
     const zona = String(req.query.zona || '').trim();
@@ -473,11 +506,10 @@ app.get('/avisos', async (req, res) => {
 
     const entry = cacheZona.get(zona);
     if (!entry) {
-      // No hay dato: no consultamos AEMET aquí
+      // No hay dato en caché para esa zona; NO se consulta AEMET aquí
       return res.status(503).json({ error: 'cache_miss', zona });
     }
 
-    // Si está expirada, devolvemos igual pero marcando stale:true para que el cliente decida
     const expired = isExpired(entry);
     const payload = {
       ...entry.payload,
