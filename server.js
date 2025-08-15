@@ -18,9 +18,12 @@
 //      - EXCLUIR avisos de nivel VERDE (solo amarillo/naranja/rojo)
 //      - EXCLUIR avisos genéricos CCAA por titular (“… CCAA”)
 //
-//   5) CAMBIO NUEVO (este archivo lo incluye):
+//   5) CAMBIO NUEVO (incluido en este archivo):
 //      - Extraer zona del nombre de fichero SOLO si aparece como AFAZ(\d{6})
 //      - Filtrar SIEMPRE las posibles zonas para que empiecen por el código del área (2 dígitos)
+//   6) CAMBIO SOLICITADO (añadido en este archivo):
+//      - Exponer descripciones de área (`areaDesc`) de las áreas cuyo geocódigo incluye la zona consultada,
+//        sin reintroducir `info[].areas[]` completo. Se añade un campo ligero `areaDescs: string[]` en cada aviso.
 // --------------------------------------------------------------------------------------------------------
 
 import express from 'express';
@@ -227,6 +230,28 @@ function alertHasZonaByGeocode_WITH_AREAS(parsedAlert, zona) {
   return false;
 }
 
+// ========================= CAMBIO NUEVO: EXTRAER areaDesc PARA LA ZONA =========================
+// Comentario: de un aviso "con áreas", devuelve las descripciones de área (areaDesc) cuyas geocodes contienen la zona.
+function extractAreaDescsForZona(parsedAlertWITH_AREAS, zona) {
+  const out = new Set();
+  const infos = Array.isArray(parsedAlertWITH_AREAS?.info) ? parsedAlertWITH_AREAS.info : [];
+  for (const inf of infos) {
+    const areas = Array.isArray(inf?.areas) ? inf.areas : [];
+    for (const a of areas) {
+      const geocodes = Array.isArray(a?.geocodes) ? a.geocodes
+                    : Array.isArray(a?.geocode) ? a.geocode
+                    : [];
+      let match = false;
+      for (const g of geocodes) {
+        const val = (g?.value ?? g?.['#text'] ?? '') + '';
+        if (val.includes(zona)) { match = true; break; }
+      }
+      if (match && a?.areaDesc) out.add(String(a.areaDesc));
+    }
+  }
+  return Array.from(out);
+}
+
 // ========================= FILTROS PERSONALIZADOS =========================
 function isGenericCCAAFileName(fileName) {
   // AFAZ<AREA>VV... => ficheros agregados de Comunidad Autónoma
@@ -416,7 +441,9 @@ async function refreshArea(area) {
           if (alertLooksGenericCCAA(aSinAreas?.info)) continue;
 
           // ✅ Pasa filtros → añadimos aviso y marcamos fichero como usado para esta zona
-          avisos.push({ file: fileName, ...aSinAreas });
+          // --- CAMBIO: añadimos areaDescs a partir de 'aConAreas' y la 'zona' concreta ---
+          const areaDescs = extractAreaDescsForZona(aConAreas, zona);
+          avisos.push({ file: fileName, ...aSinAreas, areaDescs });
           if (!usedFilesByZona.has(zona)) usedFilesByZona.set(zona, new Set());
           usedFilesByZona.get(zona).add(fileName);
         }
@@ -471,7 +498,9 @@ async function refreshArea(area) {
         if (alertLooksGenericCCAA(aSinAreas?.info)) continue;
 
         // ✅ Pasa filtros
-        avisos.push({ file: fileName, ...aSinAreas });
+        // --- CAMBIO: añadimos areaDescs a partir de 'aConAreas' y la 'zona' concreta ---
+        const areaDescs = extractAreaDescsForZona(aConAreas, zona);
+        avisos.push({ file: fileName, ...aSinAreas, areaDescs });
         if (!usedFilesByZona.has(zona)) usedFilesByZona.set(zona, new Set());
         usedFilesByZona.get(zona).add(fileName);
       }
