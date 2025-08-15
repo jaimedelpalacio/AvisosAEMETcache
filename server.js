@@ -656,31 +656,107 @@ app.get('/avisos', async (req, res) => {
 });
 
 
-// Nuevo endpoint para ver el estado de cada área en caché
+// --- PÚBLICO: estado por áreas (GET /areas/status[?area=NN][&include_empty=1]) ---
+// Agrupa la caché por zona (cacheZona) en áreas (dos dígitos en query.area) y devuelve métricas.
+// - ?area=NN           → filtra por un área concreta (p.ej. 61)
+// - &include_empty=1   → incluye áreas definidas en AREAS aunque no tengan zonas en caché
 app.get('/areas/status', (req, res) => {
   try {
-    // cache es el objeto que ya usa el microservicio para guardar datos por área
-    const status = Object.keys(cache).map(area => {
-      const entry = cache[area];
-      return {
-        area,
-        last_success_at: entry.last_success_at || null,
-        fetched_at: entry.cache?.fetched_at || null,
-        ttl_seconds: entry.cache?.ttl_seconds || null,
-        expired: entry.cache?.expired || false
-      };
-    });
+    const areaFilter = String(req.query.area || '').trim(); // '61', '62', ...
+    const includeEmpty = ['1', 'true', 'yes'].includes(String(req.query.include_empty || '').toLowerCase());
 
-    res.json(status);
-  } catch (error) {
-    console.error('Error generando /areas/status', error);
-    res.status(500).json({ error: 'No se pudo generar el estado de las áreas' });
+    // Agrupamos por área recorriendo la caché por zona
+    // cacheZona: Map<zona_6d, { payload:{ query:{ area, last_success_at, ... } }, fetchedAt, stale }>
+    const byArea = new Map();
+
+    for (const [zona, entry] of cacheZona.entries()) {
+      const area = String(entry?.payload?.query?.area || String(zona).slice(0, 2)).padStart(2, '0');
+      if (areaFilter && area !== areaFilter) continue;
+
+      const expired = isExpired(entry);
+      const rec = byArea.get(area) || {
+        area,
+        zones: new Set(),
+        zones_count: 0,
+        last_success_at_latest: null,
+        last_success_at_earliest: null,
+        fetched_at_latest: null,
+        fetched_at_earliest: null,
+        expired_any: false,
+        expired_all: true
+      };
+
+      rec.zones.add(zona);
+      rec.zones_count = rec.zones.size;
+
+      // last_success_at viene de la query que guardamos al refrescar el área
+      const lsStr = entry?.payload?.query?.last_success_at || null;
+      const ls = lsStr ? new Date(lsStr) : null;
+      if (ls) {
+        rec.last_success_at_latest = !rec.last_success_at_latest || ls > rec.last_success_at_latest ? ls : rec.last_success_at_latest;
+        rec.last_success_at_earliest = !rec.last_success_at_earliest || ls < rec.last_success_at_earliest ? ls : rec.last_success_at_earliest;
+      }
+
+      // fetchedAt es cuándo metimos en caché esa zona en este servicio
+      const fa = new Date(entry.fetchedAt);
+      rec.fetched_at_latest = !rec.fetched_at_latest || fa > rec.fetched_at_latest ? fa : rec.fetched_at_latest;
+      rec.fetched_at_earliest = !rec.fetched_at_earliest || fa < rec.fetched_at_earliest ? fa : rec.fetched_at_earliest;
+
+      rec.expired_any = rec.expired_any || expired;
+      rec.expired_all = rec.expired_all && expired;
+
+      byArea.set(area, rec);
+    }
+
+    // Si piden include_empty, añadimos áreas configuradas en AREAS que no tengan caché aún
+    if (includeEmpty) {
+      for (const a of AREAS) {
+        const aa = String(a).padStart(2, '0');
+        if (areaFilter && aa !== areaFilter) continue;
+        if (!byArea.has(aa)) {
+          byArea.set(aa, {
+            area: aa,
+            zones: new Set(),
+            zones_count: 0,
+            last_success_at_latest: null,
+            last_success_at_earliest: null,
+            fetched_at_latest: null,
+            fetched_at_earliest: null,
+            expired_any: null,  // desconocido (no hay caché)
+            expired_all: null
+          });
+        }
+      }
+    }
+
+    // Formateamos salida
+    const out = Array.from(byArea.values()).map(r => ({
+      area: r.area,
+      zones_count: r.zones_count,
+      sample_zones: Array.from(r.zones).slice(0, 5),
+      ttl_seconds: CACHE_TTL_SECONDS, // del entorno
+      last_success_at_latest: r.last_success_at_latest ? r.last_success_at_latest.toISOString() : null,
+      last_success_at_earliest: r.last_success_at_earliest ? r.last_success_at_earliest.toISOString() : null,
+      fetched_at_latest: r.fetched_at_latest ? r.fetched_at_latest.toISOString() : null,
+      fetched_at_earliest: r.fetched_at_earliest ? r.fetched_at_earliest.toISOString() : null,
+      expired_any: r.expired_any,
+      expired_all: r.expired_all
+    }));
+
+    // Orden por área ascendente
+    out.sort((a, b) => a.area.localeCompare(b.area));
+
+    res.json({ ok: true, areas: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
+
 
 
 
 app.listen(PORT, () => {
   console.log(`AEMET avisos por zona – caché escuchando en :${PORT}`);
 });
+
 
