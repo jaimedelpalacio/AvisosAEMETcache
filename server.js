@@ -1,29 +1,12 @@
 // server.js
 // Microservicio AEMET – caché por zona con refresco vía cron (admin) y lectura pública sin llamadas a AEMET
 // --------------------------------------------------------------------------------------------------------
-// Objetivo solicitado:
-//   1) Separar CAPTURA (AEMET vía /admin/*, la invoca el cron de Render) de CONSULTA pública (/avisos),
-//      que solo lee de caché y NUNCA llama a AEMET.
-//   2) Para cada zona (6 dígitos), ACUMULAR TODOS los avisos presentes en el TAR/XML “ultimoelaborado”,
-//      sin perder ninguno por sobrescritura, con deduplicación por (file + header.identifier).
-//   3) La respuesta pública mantiene la ESTRUCTURA original (compatible con MT Neo):
-//        { query, ficheros, avisos, stale, cache }
-//      PERO eliminando campos pesados:
-//        - NO devolver `metadatos`
-//        - NO incluir `areas` dentro de `info`
-//        - NO incluir `raw_xml`
+// Cambios introducidos en esta versión:
+//   • Estado global de ingesta (ingestState) para saber último intento/éxito/error de refresh.
+//   • Endpoint /health enriquecido con last_refresh_* (incluye explicación legible del error).
+//   • Endpoints admin instrumentados para actualizar ingestState sin alterar su contrato.
 //
-//   4) Filtros ya integrados:
-//      - NO procesar ficheros “generales CCAA” (patrón AFAZ<AREA>VV…)
-//      - EXCLUIR avisos de nivel VERDE (solo amarillo/naranja/rojo)
-//      - EXCLUIR avisos genéricos CCAA por titular (“… CCAA”)
-//
-//   5) CAMBIO NUEVO (incluido en este archivo):
-//      - Extraer zona del nombre de fichero SOLO si aparece como AFAZ(\d{6})
-//      - Filtrar SIEMPRE las posibles zonas para que empiecen por el código del área (2 dígitos)
-//   6) CAMBIO SOLICITADO (añadido en este archivo):
-//      - Exponer descripciones de área (`areaDesc`) de las áreas cuyo geocódigo incluye la zona consultada,
-//        sin reintroducir `info[].areas[]` completo. Se añade un campo ligero `areaDescs: string[]` en cada aviso.
+// NOTA: El resto del comportamiento se mantiene igual (caché por zona, filtros, endpoints).
 // --------------------------------------------------------------------------------------------------------
 
 import express from 'express';
@@ -45,6 +28,54 @@ app.use(express.json({ limit: '4mb' }));
 
 // ========================= CACHÉ EN MEMORIA (por zona) =========================
 const cacheZona = new Map(); // key: '614101' -> { payload, fetchedAt, stale }
+
+// ========================= ESTADO GLOBAL DE INGESTA (nuevo) =========================
+// Se usa para enriquecer /health SIN necesidad de forzar un refresh desde fuera.
+const ingestState = {
+  last_attempt_at: null,       // ISO del último intento (OK o error)
+  last_ok_at: null,            // ISO del último refresh exitoso
+  last_error_at: null,         // ISO del último refresh fallido
+  last_error_message: null     // Mensaje técnico del último error
+};
+
+// Marca intento de refresco (se invoca justo antes de llamar a refreshArea / refresh-all)
+function markIngestAttempt() {
+  ingestState.last_attempt_at = new Date().toISOString();
+}
+
+// Marca éxito de refresco (se invoca tras un refresh OK)
+function markIngestOk() {
+  ingestState.last_ok_at = new Date().toISOString();
+  // En un OK limpiamos la señal de error previo
+  ingestState.last_error_at = null;
+  ingestState.last_error_message = null;
+}
+
+// Marca error de refresco (se invoca si refresh falla)
+function markIngestError(e) {
+  ingestState.last_error_at = new Date().toISOString();
+  ingestState.last_error_message = String(e?.message || e);
+}
+
+// Traduce mensajes técnicos a algo legible para monitorización
+function explainError(msg) {
+  if (!msg) return null;
+  const m = String(msg).toLowerCase();
+
+  if (m.includes('http 503')) return 'AEMET no disponible (503 temporal).';
+  if (m.includes('http 404')) return 'Recurso de AEMET no encontrado (404).';
+  if (m.includes('http 500')) return 'Fallo interno en AEMET (500).';
+  if (m.includes('http 429')) return 'Límite de peticiones superado (429).';
+  if (m.includes('abort') || m.includes('timeout')) return 'Tiempo de espera agotado al contactar con AEMET.';
+  if (m.includes('fetch failed')) return 'Fallo de red al contactar con AEMET.';
+  if (m.includes('sin "datos"') || m.includes('sin \'datos\'')) return 'Catálogo de AEMET sin campo "datos".';
+  if (m.includes('invalid xml') || m.includes('unexpected') || m.includes('xml')) return 'XML de AEMET inválido o corrupto.';
+  if (m.includes('gzip') || m.includes('tar') || m.includes('descompres')) return 'Fichero TAR/XML corrupto o no descomprimible.';
+  if (m.includes('falta aemet_api_key')) return 'Configuración: falta la API key de AEMET.';
+  if (m.includes('parámetro "area" inválido') || m.includes('parametro "area" invalido')) return 'Parámetro "area" inválido (debe ser 2 dígitos).';
+
+  return 'Error de refresco desde AEMET no clasificado.';
+}
 
 function nowMs() { return Date.now(); }
 function isExpired(entry) {
@@ -230,8 +261,7 @@ function alertHasZonaByGeocode_WITH_AREAS(parsedAlert, zona) {
   return false;
 }
 
-// ========================= CAMBIO NUEVO: EXTRAER areaDesc PARA LA ZONA =========================
-// Comentario: de un aviso "con áreas", devuelve las descripciones de área (areaDesc) cuyas geocodes contienen la zona.
+// ========================= EXTRAER areaDesc PARA LA ZONA =========================
 function extractAreaDescsForZona(parsedAlertWITH_AREAS, zona) {
   const out = new Set();
   const infos = Array.isArray(parsedAlertWITH_AREAS?.info) ? parsedAlertWITH_AREAS.info : [];
@@ -315,7 +345,7 @@ async function refreshArea(area) {
   const ficheros = [];
   const nowIso = new Date().toISOString();
 
-  // 🔎 Para limpiar `ficheros`: guardamos por zona qué ficheros han aportado avisos tras filtros
+  // Guardamos por zona qué ficheros han aportado avisos tras filtros (para depurar `ficheros`)
   const usedFilesByZona = new Map(); // zona -> Set(fileName)
 
   // Auxiliar de deduplicado por 'file + header.identifier'
@@ -378,14 +408,14 @@ async function refreshArea(area) {
       ficheros.push({ name: ent.name, size: ent.size, sha1: ent.sha1, matched_by: null });
     }
 
-    // ⚙️ Código de área (2 dígitos), lo usamos para filtrar zonas válidas
+    // Código de área (2 dígitos), lo usamos para filtrar zonas válidas
     const areaCode = String(area).padStart(2, '0');
 
     // Procesamos cada entrada XML del TAR
     for (const e of entries) {
       if (!e.name.toLowerCase().endsWith('.xml')) continue;
 
-      // ⛔️ Saltar ficheros generales CCAA (VV) directamente (ahorro CPU/I/O)
+      // Saltar ficheros generales CCAA (VV)
       if (isGenericCCAAFileName(e.name)) continue;
 
       const fileName = e.name;
@@ -398,14 +428,13 @@ async function refreshArea(area) {
       // Detectar posibles zonas candidatas (nombre de fichero + geocódigos)
       const posiblesZonas = new Set();
 
-      // ✅ EXTRAER zona SOLO si aparece como AFAZ(\d{6}) en el nombre
-      //    Ej.: ...AFAZ614102ATTA...
+      // EXTRAER zona SOLO si aparece como AFAZ(\d{6}) en el nombre
       const m = fileName.match(/AFAZ(\d{6})/i);
       if (m && m[1].startsWith(areaCode)) {
         posiblesZonas.add(m[1]);
       }
 
-      // ✅ Añadir zonas desde geocódigos, SOLO si empiezan por el código de área
+      // Añadir zonas desde geocódigos, SOLO si empiezan por el código de área
       for (const pa of parsedWithAreas) {
         if (!pa) continue;
         for (const inf of asArray(pa.info)) {
@@ -421,7 +450,7 @@ async function refreshArea(area) {
         }
       }
 
-      // ✅ Iteramos SOLO por zonas compatibles con el área
+      // Iteramos SOLO por zonas compatibles con el área
       for (const zona of posiblesZonas) {
         const avisos = [];
         const matchedByName = fileMatchesZonaByName(fileName, zona);
@@ -434,14 +463,13 @@ async function refreshArea(area) {
           const matchedGeo = aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false;
           if (!(matchedByName || matchedGeo)) continue;
 
-          // ⛔️ Excluir VERDE
+          // Excluir VERDE
           if (!alertHasNonGreenLevel(aSinAreas?.info)) continue;
 
-          // ⛔️ Excluir genéricos CCAA
+          // Excluir genéricos CCAA
           if (alertLooksGenericCCAA(aSinAreas?.info)) continue;
 
-          // ✅ Pasa filtros → añadimos aviso y marcamos fichero como usado para esta zona
-          // --- CAMBIO: añadimos areaDescs a partir de 'aConAreas' y la 'zona' concreta ---
+          // Pasa filtros → añadimos aviso y marcamos fichero como usado para esta zona
           const areaDescs = extractAreaDescsForZona(aConAreas, zona);
           avisos.push({ file: fileName, ...aSinAreas, areaDescs });
           if (!usedFilesByZona.has(zona)) usedFilesByZona.set(zona, new Set());
@@ -457,15 +485,12 @@ async function refreshArea(area) {
     // XML directo (sin TAR)
     const xml = decodeToString(dataBuf);
 
-    // Parseo doble: con áreas (solo matching) y sin áreas (salida ligera)
     const parsedWithAreas = parseCap_FOR_MATCHING(xml);
     const parsedWithoutAreas = parseCapXmlWithoutAreas(xml);
 
-    // Como no hay nombre de fichero real, usamos un nombre lógico
     const fileName = 'datos.xml';
     const ficherosXml = [{ name: fileName, size: xml.length, sha1: null, matched_by: 'geocode' }];
 
-    // ⚙️ Código de área (2 dígitos), para filtrar geocódigos
     const areaCode = String(area).padStart(2, '0');
 
     const posiblesZonas = new Set();
@@ -491,14 +516,9 @@ async function refreshArea(area) {
         const matched = aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false;
         if (!matched) continue;
 
-        // ⛔️ Excluir VERDE
         if (!alertHasNonGreenLevel(aSinAreas?.info)) continue;
-
-        // ⛔️ Excluir genéricos CCAA
         if (alertLooksGenericCCAA(aSinAreas?.info)) continue;
 
-        // ✅ Pasa filtros
-        // --- CAMBIO: añadimos areaDescs a partir de 'aConAreas' y la 'zona' concreta ---
         const areaDescs = extractAreaDescsForZona(aConAreas, zona);
         avisos.push({ file: fileName, ...aSinAreas, areaDescs });
         if (!usedFilesByZona.has(zona)) usedFilesByZona.set(zona, new Set());
@@ -510,7 +530,6 @@ async function refreshArea(area) {
     }
   }
 
-  // Nota: `ficheros` ya se depura por zona dentro de upsertZona usando usedFilesByZona.
   return { area, filesCount: isTar ? (entries?.length || 0) : 1 };
 }
 
@@ -524,7 +543,6 @@ function parseCap_FOR_MATCHING(xmlText) {
   });
   const root = p2.parse(xmlText);
   const alerts = asArray(root?.alert || root?.['cap:alert']);
-  // Mantener info.areas y geocodes tal cual para verificar zona
   return alerts.map((alert) => ({
     header: {
       identifier: alert?.identifier ?? null,
@@ -588,14 +606,40 @@ app.get('/', (_, res) => {
   res.type('text/plain').send('AEMET avisos por zona – API de caché (cron/admin + consulta)');
 });
 
-// Health: muestra tamaño de caché y zonas de ejemplo
+// Health: ahora incluye estado de último refresh (OK/error) además de la foto de caché
 app.get('/health', (_, res) => {
+  // Determinamos si el último evento fue OK o error comparando timestamps
+  const lastOk = ingestState.last_ok_at ? new Date(ingestState.last_ok_at) : null;
+  const lastErr = ingestState.last_error_at ? new Date(ingestState.last_error_at) : null;
+
+  // "Último refresh OK" si existe OK y (no hay error posterior o el OK es más reciente que el error)
+  const last_refresh_ok =
+    !!lastOk && (!lastErr || lastOk >= lastErr);
+
+  // Mostramos el "último intento" si existe, si no el último OK o el último error
+  const last_refresh_at =
+    ingestState.last_attempt_at ||
+    ingestState.last_ok_at ||
+    ingestState.last_error_at ||
+    null;
+
+  // Solo enseñamos el error si es el evento más reciente (o si nunca hubo OK)
+  const showError =
+    !!ingestState.last_error_message && (!lastOk || (lastErr && lastErr >= lastOk));
+
+  const last_refresh_error = showError ? ingestState.last_error_message : null;
+  const last_refresh_error_explained = showError ? explainError(ingestState.last_error_message) : null;
+
   const sample = Array.from(cacheZona.keys()).slice(0, 5);
   res.json({
     ok: true,
     zones_cached: cacheZona.size,
     sample_zones: sample,
-    ttl_seconds: CACHE_TTL_SECONDS
+    ttl_seconds: CACHE_TTL_SECONDS,
+    last_refresh_at,
+    last_refresh_ok,
+    last_refresh_error,
+    last_refresh_error_explained
   });
 });
 
@@ -608,9 +652,18 @@ app.post('/admin/refresh', requireCronToken, async (req, res) => {
       e.status = 400;
       throw e;
     }
+    // ⏱ Marca intento
+    markIngestAttempt();
+
     const r = await refreshArea(area);
+
+    // ✅ Marca éxito global
+    markIngestOk();
+
     res.json({ ok: true, ...r });
   } catch (err) {
+    // ❌ Marca error global (con mensaje técnico)
+    markIngestError(err);
     res.status(err.status || 500).json({ ok: false, error: String(err.message || err) });
   }
 });
@@ -623,7 +676,12 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
       return res.status(400).json({ ok: false, error: 'No hay áreas definidas. Usa body {"areas":[..]} o variable AREAS.' });
     }
 
+    // ⏱ Marca intento global al inicio del lote
+    markIngestAttempt();
+
     const results = [];
+    let anyError = false;
+
     for (const a of areas) {
       const a2 = String(a).padStart(2, '0');
       try {
@@ -631,11 +689,23 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
         results.push({ area: a2, ok: true, filesCount: r.filesCount });
         await sleep(250); // pequeño respiro para no saturar AEMET
       } catch (e) {
+        anyError = true;
         results.push({ area: a2, ok: false, error: String(e.message || e) });
       }
     }
+
+    // Si hubo algún error en el lote, reflejamos el último error; si no, OK global
+    if (anyError) {
+      const lastErrItem = [...results].reverse().find(r => r.ok === false);
+      markIngestError({ message: `refresh-all: ${lastErrItem?.area} → ${lastErrItem?.error || 'error'}` });
+    } else {
+      markIngestOk();
+    }
+
     res.json({ ok: true, results });
   } catch (err) {
+    // Error estructural del endpoint
+    markIngestError(err);
     res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
