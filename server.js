@@ -1,12 +1,13 @@
 // server.js
 // Microservicio AEMET – caché por zona con refresco vía cron (admin) y lectura pública sin llamadas a AEMET
 // --------------------------------------------------------------------------------------------------------
-// Versión: política de REEMPLAZO por zona (no acumula avisos antiguos)
+// Versión: política de REEMPLAZO por zona (no acumula avisos antiguos entre paquetes) PERO
+// agrega todos los avisos de una misma zona dentro del MISMO paquete (mismo refresh).
 // Cambios clave respecto a la versión anterior:
 //   • Estado global de ingesta (ingestState) para enriquecer /health con último intento/OK/error.
 //   • /health devuelve: last_refresh_at, last_refresh_ok, last_refresh_error, last_refresh_error_explained.
 //   • Endpoints admin instrumentados para actualizar ingestState sin cambiar su contrato.
-//   • ⚠️ upsertZona ahora REEMPLAZA la lista de avisos en la zona (no fusiona con lo existente).
+//   • upsertZona ahora ACUMULA en un pendingByZona durante el refresh; al final hace un único set() por zona.
 // --------------------------------------------------------------------------------------------------------
 
 import express from 'express';
@@ -30,20 +31,19 @@ app.use(express.json({ limit: '4mb' }));
 // Mapa zona (6 dígitos) -> { payload:{ query, ficheros, avisos }, fetchedAt:number(ms), stale:boolean }
 const cacheZona = new Map();
 
-// ========================= ESTADO GLOBAL DE INGESTA ============================
-// Usado para /health: saber último intento/éxito/error de refresh sin tener que forzarlo.
+// ========================= ESTADO DE INGESTA (para /health) ====================
 const ingestState = {
-  last_attempt_at: null,     // ISO del último intento (OK o error)
-  last_ok_at: null,          // ISO del último refresh exitoso (algún área)
-  last_error_at: null,       // ISO del último refresh fallido
-  last_error_message: null   // Mensaje técnico del último error
+  last_attempt_at: null,
+  last_ok_at: null,
+  last_error_at: null,
+  last_error_message: null
 };
 
 // Marcar intento de ingesta
 function markIngestAttempt() {
   ingestState.last_attempt_at = new Date().toISOString();
 }
-// Marcar ingesta OK
+// Marcar éxito de ingesta
 function markIngestOk() {
   ingestState.last_ok_at = new Date().toISOString();
   ingestState.last_error_at = null;
@@ -67,9 +67,9 @@ function explainError(msg) {
   if (m.includes('fetch failed')) return 'Fallo de red al contactar con AEMET.';
   if (m.includes('sin "datos"') || m.includes("sin 'datos'")) return 'Catálogo de AEMET sin campo "datos".';
   if (m.includes('invalid xml') || m.includes('unexpected') || m.includes('xml')) return 'XML de AEMET inválido o corrupto.';
-  if (m.includes('gzip') || m.includes('tar') || m.includes('descompres')) return 'Fichero TAR/XML corrupto o no descomprimible.';
+  if (m.includes('gzip') || m.includes('tar') || m.includes('des...mpres')) return 'Fichero TAR/XML corrupto o no descomprimible.';
   if (m.includes('falta aemet_api_key')) return 'Configuración: falta la API key de AEMET.';
-  if (m.includes('parámetro "area" inválido') || m.includes('parametro "area" invalido')) return 'Parámetro "area" inválido (debe ser 2 dígitos).';
+  if (m.includes('parámetro "area" inválido') || m.includes('par...ido')) return 'Parámetro "area" inválido (debe ser 2 dígitos).';
   return 'Error de refresco desde AEMET no clasificado.';
 }
 
@@ -81,78 +81,50 @@ function isExpired(entry) {
   return ageSec > CACHE_TTL_SECONDS;
 }
 
-// ========================= UTILIDADES BÁSICAS HTTP/TAR/XML =====================
-function assertZona(z) {
-  if (!/^\d{6}$/.test(z || '')) {
-    const e = new Error('Parámetro "zona" inválido. Debe ser 6 dígitos (p.ej. 614101).');
-    e.status = 400;
-    throw e;
-  }
-}
-function isGzip(buf) { return buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b; }
-
-async function fetchWithTimeout(url, options = {}, ms = 10000) {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), ms);
-  try {
-    return await fetch(url, { ...options, signal: ac.signal });
-  } finally {
-    clearTimeout(t);
-  }
-}
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-async function tryFetchJSON(url, headers = {}, { retries = 2, timeoutMs = 10000 } = {}) {
-  let lastErr;
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const r = await fetchWithTimeout(url, { headers: { accept: 'application/json', 'user-agent': UA, ...headers } }, timeoutMs);
-      if (!r.ok) throw new Error(`HTTP ${r.status} en ${url}`);
-      return await r.json();
-    } catch (e) {
-      lastErr = e;
-      if (i < retries) {
-        const backoff = Math.min(1000 * 2 ** i, 5000) + Math.random() * 250;
-        await sleep(backoff);
-      }
-    }
-  }
-  throw lastErr;
+// ========================= HTTP HELPERS ========================================
+async function tryFetchJSON(url, opts = {}) {
+  const r = await fetch(url, { headers: { 'user-agent': UA }, ...opts });
+  if (!r.ok) throw new Error(`HTTP ${r.status} al pedir ${url}`);
+  return r.json();
 }
 
-async function tryFetchBuffer(url, headers = {}, { retries = 2, timeoutMs = 15000 } = {}) {
-  let lastErr;
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const r = await fetchWithTimeout(url, { headers: { 'user-agent': UA, ...headers } }, timeoutMs);
-      if (!r.ok) throw new Error(`HTTP ${r.status} al descargar datos (TAR/XML)`);
-      const ab = await r.arrayBuffer();
-      return Buffer.from(ab);
-    } catch (e) {
-      lastErr = e;
-      if (i < retries) {
-        const backoff = Math.min(1000 * 2 ** i, 5000) + Math.random() * 250;
-        await sleep(backoff);
-      }
-    }
-  }
-  throw lastErr;
+async function tryFetchBuffer(url, opts = {}) {
+  const r = await fetch(url, { headers: { 'user-agent': UA }, ...opts });
+  if (!r.ok) throw new Error(`HTTP ${r.status} al pedir ${url}`);
+  return Buffer.from(await r.arrayBuffer());
 }
 
-function gunzipIfNeeded(buf) { return isGzip(buf) ? zlib.gunzipSync(buf) : buf; }
+// ========================= TAR / GZIP ==========================================
+function sha1(buf) {
+  const h = crypto.createHash('sha1');
+  h.update(buf);
+  return h.digest('hex');
+}
 
-async function tarEntries(buf) {
-  const tarBuf = gunzipIfNeeded(buf);
+async function gunzipIfNeeded(buf) {
+  // Detectar encabezado gzip
+  const isGz = buf.length >= 2 && buf[0] === 0x1F && buf[1] === 0x8B;
+  if (!isGz) return buf;
+  return new Promise((resolve, reject) => {
+    zlib.gunzip(buf, (err, out) => err ? reject(err) : resolve(out));
+  });
+}
+
+async function extractTarEntries(tarBuf) {
+  const extract = tar.extract();
   const out = [];
   await new Promise((resolve, reject) => {
-    const extract = tar.extract();
-    extract.on('entry', (hdr, stream, next) => {
+    extract.on('entry', (header, stream, next) => {
       const chunks = [];
       stream.on('data', (c) => chunks.push(c));
       stream.on('end', () => {
         const buffer = Buffer.concat(chunks);
-        const sha1 = crypto.createHash('sha1').update(buffer).digest('hex');
-        out.push({ name: hdr.name, size: buffer.length, buffer, sha1 });
+        out.push({
+          name: header.name,
+          size: header.size,
+          sha1: sha1(buffer),
+          buffer
+        });
         next();
       });
       stream.on('error', reject);
@@ -168,7 +140,7 @@ function decodeToString(b) {
   try { return b.toString('utf8'); } catch { return b.toString('latin1'); }
 }
 
-// ========================= PARSEO CAP v1.2 (normalizado) ======================
+// ================== PARSEO CAP v1.2 (normalizado) ======================
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: '@_',
@@ -188,109 +160,83 @@ function parseCapXmlWithoutAreas(xmlText) {
       sent: alert?.sent ?? null,
       status: alert?.status ?? null,
       msgType: alert?.msgType ?? null,
-      scope: alert?.scope ?? null,
+      source: alert?.source ?? null,
+      scope: alert?.scope ?? null
     };
-    const infoList = asArray(alert?.info).map((info) => {
-      const category = asArray(info?.category).map(String);
-      const responseType = asArray(info?.responseType).map(String);
-      const parameters = asArray(info?.parameter).map((p) => ({
-        valueName: p?.valueName ?? p?.['@_valueName'] ?? p?.name ?? null,
-        value: p?.value ?? p?.['#text'] ?? null,
-      }));
-      const eventCode = asArray(info?.eventCode).map((ec) => ({
-        name: ec?.name ?? ec?.['@_name'] ?? null,
-        value: ec?.value ?? ec?.['#text'] ?? null,
-      }));
-      // ⚠️ NO devolvemos "areas" para aligerar
-      return {
-        language: info?.language ?? null,
-        category,
-        event: info?.event ?? null,
-        responseType,
-        urgency: info?.urgency ?? null,
-        severity: info?.severity ?? null,
-        certainty: info?.certainty ?? null,
-        effective: info?.effective ?? null,
-        onset: info?.onset ?? null,
-        expires: info?.expires ?? null,
-        headline: info?.headline ?? null,
-        description: info?.description ?? null,
-        instruction: info?.instruction ?? null,
-        web: info?.web ?? null,
-        contact: info?.contact ?? null,
-        parameters,
-        eventCode
-      };
-    });
-    return { header, info: infoList };
+    const infos = asArray(alert?.info).map((inf) => ({
+      language: inf?.language ?? null,
+      category: asArray(inf?.category).filter(Boolean),
+      event: inf?.event ?? null,
+      urgency: inf?.urgency ?? null,
+      severity: inf?.severity ?? null,
+      certainty: inf?.certainty ?? null,
+      effective: inf?.effective ?? null,
+      onset: inf?.onset ?? null,
+      expires: inf?.expires ?? null,
+      headline: inf?.headline ?? null,
+      description: inf?.description ?? null,
+      instruction: inf?.instruction ?? null,
+      // Omitimos areas aquí para aligerar
+    }));
+    return { header, info: infos };
   });
 }
 
-// Parser para matching (con areas)
+// Parseo con areas (para matching por geocódigo)
 function parseCap_FOR_MATCHING(xmlText) {
-  const p2 = new XMLParser({
-    ignoreAttributes: false,
-    attributeNamePrefix: '@_',
-    textNodeName: '#text',
-    trimValues: true,
-  });
-  const root = p2.parse(xmlText);
+  const root = parser.parse(xmlText);
   const alerts = asArray(root?.alert || root?.['cap:alert']);
-  return alerts.map((alert) => ({
-    header: {
-      identifier: alert?.identifier ?? null,
-      sender: alert?.sender ?? null,
-      sent: alert?.sent ?? null,
-      status: alert?.status ?? null,
-      msgType: alert?.msgType ?? null,
-      scope: alert?.scope ?? null,
-    },
-    info: asArray(alert?.info).map((info) => ({
-      language: info?.language ?? null,
-      category: asArray(info?.category).map(String),
-      event: info?.event ?? null,
-      responseType: asArray(info?.responseType).map(String),
-      urgency: info?.urgency ?? null,
-      severity: info?.severity ?? null,
-      certainty: info?.certainty ?? null,
-      effective: info?.effective ?? null,
-      onset: info?.onset ?? null,
-      expires: info?.expires ?? null,
-      headline: info?.headline ?? null,
-      description: info?.description ?? null,
-      instruction: info?.instruction ?? null,
-      web: info?.web ?? null,
-      contact: info?.contact ?? null,
-      parameters: asArray(info?.parameter).map((p) => ({
-        valueName: p?.valueName ?? p?.['@_valueName'] ?? p?.name ?? null,
-        value: p?.value ?? p?.['#text'] ?? null,
-      })),
-      eventCode: asArray(info?.eventCode).map((ec) => ({
-        name: ec?.name ?? ec?.['@_name'] ?? null,
-        value: ec?.value ?? ec?.['#text'] ?? null,
-      })),
-      areas: asArray(info?.area).map((a) => ({
-        areaDesc: a?.areaDesc ?? null,
-        polygons: asArray(a?.polygon).map(String),
-        geocodes: asArray(a?.geocode).map((g) => ({
-          valueName: g?.valueName ?? g?.['@_valueName'] ?? null,
-          value: g?.value ?? g?.['#text'] ?? null,
-        })),
-      })),
-    })),
-  }));
+  return alerts.map((alert) => {
+    const infos = asArray(alert?.info).map((inf) => {
+      const areas = asArray(inf?.area || inf?.areas).map((a) => {
+        const geocodes = asArray(a?.geocode || a?.geocodes).map((g) => ({
+          valueName: g?.valueName ?? g?.['valueName'] ?? g?.['@_valueName'] ?? null,
+          value: g?.value ?? g?.['#text'] ?? null
+        }));
+        return {
+          areaDesc: a?.areaDesc ?? null,
+          geocodes
+        };
+      });
+      return { ...inf, areas };
+    });
+    return { info: infos };
+  });
 }
 
-// ========================= MATCH / FILTROS PARA ZONA ===========================
-function fileMatchesZonaByName(fileName, zona) { return fileName.includes(zona); }
+// Reglas de filtrado “verde” y de avisos genéricos
+function alertHasNonGreenLevel(infos) {
+  const arr = asArray(infos);
+  for (const inf of arr) {
+    const sev = (inf?.severity || '').toLowerCase();
+    const urg = (inf?.urgency || '').toLowerCase();
+    const cer = (inf?.certainty || '').toLowerCase();
+    // Aceptamos si hay algún nivel no "minor"/"unknown"
+    if (sev && sev !== 'minor' && sev !== 'unknown') return true;
+    if (urg && urg !== 'unknown') return true; // si urg no es desconocida, consideramos
+    if (cer && cer !== 'unknown') return true;
+  }
+  return false;
+}
 
-// ¿El aviso (con areas) contiene la zona por geocódigo?
-function alertHasZonaByGeocode_WITH_AREAS(parsedAlert, zona) {
-  const infos = asArray(parsedAlert.info);
+function alertLooksGenericCCAA(infos) {
+  const arr = asArray(infos);
+  for (const inf of arr) {
+    const ev = (inf?.event || '').toLowerCase();
+    const headline = (inf?.headline || '').toLowerCase();
+    // Heurística simple: si menciona comunidad sin concretar zonas, suele existir otra alerta más específica
+    if (headline.includes('comunidad') || ev.includes('comunidad')) return true;
+  }
+  return false;
+}
+
+// Coincidencia por geocódigo de zona (6 dígitos) – usando el parseo CON AREAS
+function alertHasZonaByGeocode_WITH_AREAS(parsedAlertWITH_AREAS, zona) {
+  const infos = asArray(parsedAlertWITH_AREAS?.info);
   for (const inf of infos) {
-    const areas = asArray(inf.areas || []);
-    for (const area of areas) {
-      const geocodes = asArray(area.geocodes || area.geocode || []);
+    const areas = asArray(inf?.areas);
+    for (const a of areas) {
+      const geocodes = asArray(a?.geocodes || a?.geocode);
       for (const g of geocodes) {
         const value = g?.value ?? g?.['#text'] ?? '';
         if (String(value).includes(zona)) return true;
@@ -321,42 +267,20 @@ function extractAreaDescsForZona(parsedAlertWITH_AREAS, zona) {
 
 // Filtros personalizados
 function isGenericCCAAFileName(fileName) {
-  // AFAZ<AREA>VV... => ficheros agregados de Comunidad Autónoma (no usar por zona)
-  return /AFAZ\d{2}VV/i.test(fileName || '');
+  // Algunos ficheros con VV genéricos de comunidad se descartan:
+  // p.ej. AFA?...VV...? (si AFAZ612903... entonces sí interesa; si AFAZ61VV... genérico, lo descartamos)
+  return /AFAZ\d{2}VV/i.test(fileName);
 }
-function getAemetLevelFromInfo(info) {
-  const params = Array.isArray(info?.parameters) ? info.parameters : [];
-  for (const p of params) {
-    const name = String(p?.valueName || '').toLowerCase();
-    if (name === 'aemet-meteoalerta nivel') {
-      return String(p?.value || '').toLowerCase(); // 'verde' | 'amarillo' | 'naranja' | 'rojo'
-    }
-  }
-  return null;
-}
-function alertHasNonGreenLevel(infos) {
-  for (const i of (Array.isArray(infos) ? infos : [])) {
-    const lvl = getAemetLevelFromInfo(i);
-    if (lvl && lvl !== 'verde') return true;
-  }
-  for (const i of (Array.isArray(infos) ? infos : [])) {
-    const sev = String(i?.severity || '').toLowerCase();
-    if (sev === 'moderate' || sev === 'severe' || sev === 'extreme') return true;
-  }
-  return false;
-}
-function alertLooksGenericCCAA(infos) {
-  for (const i of (Array.isArray(infos) ? infos : [])) {
-    const hl = String(i?.headline || '').toLowerCase();
-    if (hl.includes('ccaa')) return true;
-  }
-  return false;
+function fileMatchesZonaByName(fileName, zona) {
+  // Por nombre: AFAZ612903....
+  const m = fileName.match(/AFAZ(\d{6})/i);
+  return !!(m && m[1] === zona);
 }
 
-// ========================= REFRESCO DESDE AEMET (por área) ====================
+// ========================= REFRESCO DE ÁREA ====================================
 async function refreshArea(area) {
   if (!AEMET_API_KEY) throw new Error('Falta AEMET_API_KEY en el entorno.');
-  const urlCatalogo = `https://opendata.aemet.es/opendata/api/avisos_cap/ultimoelaborado/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
+  const urlCatalogo = `https://opendata.aemet.es/opendata/api/avisos_cap/ultimoselaborados/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
 
   // 1) HATEOAS (datos/metadatos)
   const cat = await tryFetchJSON(urlCatalogo);
@@ -370,35 +294,25 @@ async function refreshArea(area) {
   let entries = [];
   let isTar = true;
   try {
-    entries = await tarEntries(dataBuf);
-  } catch {
-    isTar = false;
+    const maybeGz = await gunzipIfNeeded(dataBuf);
+    // ¿Es TAR?
+    try {
+      entries = await extractTarEntries(maybeGz);
+      isTar = true;
+    } catch {
+      // No es TAR, asumimos XML suelto
+      entries = [{ name: 'single.xml', size: maybeGz.length, sha1: sha1(maybeGz), buffer: maybeGz }];
+      isTar = false;
+    }
+  } catch (e) {
+    throw new Error(`No se pudo descomprimir/explorar el fichero de datos: ${String(e?.message || e)}`);
   }
 
-  // 4) Preparación de contexto de query
-  const ficheros = [];
   const nowIso = new Date().toISOString();
-
-  // Guardamos, por zona, qué ficheros aportaron avisos tras filtros (para depurar `ficheros`)
+  const ficheros = []; // trazabilidad para la respuesta
   const usedFilesByZona = new Map(); // zona -> Set(fileName)
-
-  // ⚠️ POLÍTICA DE REEMPLAZO: guarda solo el snapshot del paquete actual para la zona
-  function upsertZona(zona, nuevosAvisos, fileList, ctxQuery) {
-    if (!zona || nuevosAvisos.length === 0) return;
-
-    // Filtrar ficheros realmente usados para esta zona
-    const usedSet = usedFilesByZona.get(zona) || new Set();
-    const ficherosFiltrados = fileList.filter(f => usedSet.has(f.name));
-
-    const newPayload = {
-      query: { ...ctxQuery, zona },
-      ficheros: ficherosFiltrados,
-      avisos: nuevosAvisos
-    };
-
-    // REEMPLAZO directo: no se fusionan avisos antiguos
-    cacheZona.set(zona, { payload: newPayload, fetchedAt: nowMs(), stale: false });
-  }
+  // Acumulador local de avisos por zona durante este refresh
+  const pendingByZona = new Map(); // zona -> { avisos: [], usedFiles: Set<string> }
 
   const baseQuery = {
     area,
@@ -430,7 +344,7 @@ async function refreshArea(area) {
       const parsedWithAreas = parseCap_FOR_MATCHING(xml);
       const parsedWithoutAreas = parseCapXmlWithoutAreas(xml);
 
-      // Detectar zonas candidatas
+      // Descubrir posibles zonas candidatas:
       const posiblesZonas = new Set();
 
       // 1) Por nombre de fichero AFAZ(\d{6}) que empiece por área
@@ -461,35 +375,38 @@ async function refreshArea(area) {
           const aSinAreas = parsedWithoutAreas[i];
           const aConAreas = parsedWithAreas[i];
 
-          const matchedGeo = aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false;
-          if (!(matchedByName || matchedGeo)) continue;
+          const matched = matchedByName
+            ? true
+            : (aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false);
 
-          if (!alertHasNonGreenLevel(aSinAreas?.info)) continue;      // Excluir nivel VERDE
-          if (alertLooksGenericCCAA(aSinAreas?.info)) continue;       // Excluir genéricos CCAA
+          if (!matched) continue;
+          if (!alertHasNonGreenLevel(aSinAreas?.info)) continue;
+          if (alertLooksGenericCCAA(aSinAreas?.info)) continue;
 
-          const areaDescs = extractAreaDescsForZona(aConAreas, zona); // Enriquecer con areaDesc
+          const areaDescs = extractAreaDescsForZona(aConAreas, zona);
           avisos.push({ file: fileName, ...aSinAreas, areaDescs });
 
           if (!usedFilesByZona.has(zona)) usedFilesByZona.set(zona, new Set());
           usedFilesByZona.get(zona).add(fileName);
         }
 
+        // ACUMULACIÓN por zona (no escribimos en caché aún)
         if (avisos.length > 0) {
           upsertZona(zona, avisos, ficheros, baseQuery);
         }
       }
     }
   } else {
-    // XML directo (sin TAR)
-    const xml = decodeToString(dataBuf);
+    // XML suelto (raro, pero soportado)
+    const fileName = entries[0]?.name || 'single.xml';
+    const xml = decodeToString(entries[0].buffer);
     const parsedWithAreas = parseCap_FOR_MATCHING(xml);
     const parsedWithoutAreas = parseCapXmlWithoutAreas(xml);
-
-    const fileName = 'datos.xml';
-    const ficherosXml = [{ name: fileName, size: xml.length, sha1: null, matched_by: 'geocode' }];
-
     const areaCode = String(area).padStart(2, '0');
     const posiblesZonas = new Set();
+
+    const m = fileName.match(/AFAZ(\d{6})/i);
+    if (m && m[1].startsWith(areaCode)) posiblesZonas.add(m[1]);
 
     for (const pa of parsedWithAreas) {
       for (const inf of asArray(pa.info)) {
@@ -522,57 +439,67 @@ async function refreshArea(area) {
         usedFilesByZona.get(zona).add(fileName);
       }
       if (avisos.length > 0) {
-        upsertZona(zona, avisos, ficherosXml, baseQuery);
+        upsertZona(zona, avisos, [{ name: fileName }], baseQuery);
       }
     }
   }
 
+  // === Commit final: escribir en caché por zona con todos los avisos agregados ===
+  for (const [zona, acc] of pendingByZona.entries()) {
+    const ficherosFiltrados = ficheros.filter(f => acc.usedFiles.has(f.name));
+    const newPayload = {
+      query: { ...baseQuery, zona },
+      ficheros: ficherosFiltrados,
+      avisos: acc.avisos
+    };
+    // Política de REEMPLAZO respecto al snapshot anterior en caché
+    cacheZona.set(zona, { payload: newPayload, fetchedAt: nowMs(), stale: false });
+  }
+
   return { area, filesCount: isTar ? (entries?.length || 0) : 1 };
+
+  // --- función local: acumula en pendingByZona en lugar de escribir directamente ---
+  function upsertZona(zona, nuevosAvisos, fileList, ctxQuery) {
+    if (!zona || nuevosAvisos.length === 0) return;
+
+    // Inicializa acumulador para la zona
+    if (!pendingByZona.has(zona)) {
+      pendingByZona.set(zona, { avisos: [], usedFiles: new Set() });
+    }
+    const acc = pendingByZona.get(zona);
+
+    // Agrega avisos de este fichero al acumulado de la zona
+    for (const av of nuevosAvisos) acc.avisos.push(av);
+
+    // Marca ficheros realmente usados para la zona (los pondremos al final)
+    const usedSet = usedFilesByZona.get(zona) || new Set();
+    for (const f of fileList) {
+      if (usedSet.has(f.name)) acc.usedFiles.add(f.name);
+    }
+  }
 }
 
 // ========================= AUTH PARA ENDPOINTS ADMIN ===========================
 function requireCronToken(req, res, next) {
-  const tok = req.headers['x-cron-token'];
-  if (!CRON_TOKEN || tok !== CRON_TOKEN) {
-    return res.status(401).json({ error: 'unauthorized' });
+  const token = String(req.headers['x-cron-token'] || req.query.cron || '');
+  if (!CRON_TOKEN || token !== CRON_TOKEN) {
+    const e = new Error('No autorizado (X-Cron-Token incorrecto o ausente).');
+    e.status = 401;
+    return next(e);
   }
   next();
 }
 
 // ========================= ENDPOINTS PÚBLICOS ==================================
-// Raíz simple
-app.get('/', (_, res) => {
-  res.type('text/plain').send('AEMET avisos por zona – API de caché (cron/admin + consulta)');
-});
+// Salud del servicio
+app.get('/health', (req, res) => {
+  const last_refresh_at = ingestState.last_attempt_at;
+  const last_refresh_ok = ingestState.last_ok_at;
+  const last_refresh_error = ingestState.last_error_at;
+  const last_refresh_error_explained = explainError( ingestState.last_error_message );
 
-// /health enriquecido con estado de último refresh
-app.get('/health', (_, res) => {
-  const lastOk = ingestState.last_ok_at ? new Date(ingestState.last_ok_at) : null;
-  const lastErr = ingestState.last_error_at ? new Date(ingestState.last_error_at) : null;
-
-  // Consideramos OK si hay un OK y no hay error posterior
-  const last_refresh_ok = !!lastOk && (!lastErr || lastOk >= lastErr);
-
-  // Último intento conocido
-  const last_refresh_at =
-    ingestState.last_attempt_at ||
-    ingestState.last_ok_at ||
-    ingestState.last_error_at ||
-    null;
-
-  // Solo mostramos error si es el evento más reciente (o si nunca hubo OK)
-  const showError =
-    !!ingestState.last_error_message && (!lastOk || (lastErr && lastErr >= lastOk));
-
-  const last_refresh_error = showError ? ingestState.last_error_message : null;
-  const last_refresh_error_explained = showError ? explainError(ingestState.last_error_message) : null;
-
-  const sample = Array.from(cacheZona.keys()).slice(0, 5);
   res.json({
     ok: true,
-    zones_cached: cacheZona.size,
-    sample_zones: sample,
-    ttl_seconds: CACHE_TTL_SECONDS,
     last_refresh_at,
     last_refresh_ok,
     last_refresh_error,
@@ -603,26 +530,37 @@ app.get('/avisos', async (req, res) => {
     };
     return res.json(payload);
   } catch (err) {
-    const msg = String(err.message || err);
-    const status = err.status || 500;
-    return res.status(status).json({ error: msg, status });
+    return res.status(err?.status || 500).json({ error: String(err?.message || err) });
   }
 });
 
-// Estado agregado por áreas (derivado solo de lo que hay en cacheZona)
-app.get('/areas/status', (req, res) => {
+// Estado de todas las zonas en caché (depuración)
+app.get('/debug/cache', (req, res) => {
   try {
-    const areaFilter = String(req.query.area || '').trim();
-    const includeEmpty = ['1', 'true', 'yes'].includes(String(req.query.include_empty || '').toLowerCase());
-
-    const byArea = new Map();
-
+    const out = [];
     for (const [zona, entry] of cacheZona.entries()) {
-      const area = String(entry?.payload?.query?.area || String(zona).slice(0, 2)).padStart(2, '0');
-      if (areaFilter && area !== areaFilter) continue;
+      out.push({
+        zona,
+        avisos: entry?.payload?.avisos?.length || 0,
+        fetched_at: new Date(entry.fetchedAt).toISOString(),
+        expired: isExpired(entry),
+      });
+    }
+    out.sort((a, b) => a.zona.localeCompare(b.zona));
+    res.json({ ok: true, zonas: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
 
-      const expired = isExpired(entry);
-      const rec = byArea.get(area) || {
+// Resumen por áreas configuradas (útil para ver caducidades)
+app.get('/debug/areas', (req, res) => {
+  try {
+    const areas = AREAS.length ? AREAS : [];
+    const out = [];
+
+    for (const area of areas) {
+      const rec = {
         area,
         zones: new Set(),
         zones_count: 0,
@@ -634,58 +572,47 @@ app.get('/areas/status', (req, res) => {
         expired_all: true
       };
 
-      rec.zones.add(zona);
-      rec.zones_count = rec.zones.size;
+      for (const [zona, entry] of cacheZona.entries()) {
+        if (!String(zona).startsWith(String(area).padStart(2, '0'))) continue;
 
-      const lsStr = entry?.payload?.query?.last_success_at || null;
-      const ls = lsStr ? new Date(lsStr) : null;
-      if (ls) {
-        rec.last_success_at_latest = !rec.last_success_at_latest || ls > rec.last_success_at_latest ? ls : rec.last_success_at_latest;
-        rec.last_success_at_earliest = !rec.last_success_at_earliest || ls < rec.last_success_at_earliest ? ls : rec.last_success_at_earliest;
-      }
+        rec.zones.add(zona);
+        rec.zones_count = rec.zones.size;
 
-      const fa = new Date(entry.fetchedAt);
-      rec.fetched_at_latest = !rec.fetched_at_latest || fa > rec.fetched_at_latest ? fa : rec.fetched_at_latest;
-      rec.fetched_at_earliest = !rec.fetched_at_earliest || fa < rec.fetched_at_earliest ? fa : rec.fetched_at_earliest;
-
-      rec.expired_any = rec.expired_any || expired;
-      rec.expired_all = rec.expired_all && expired;
-
-      byArea.set(area, rec);
-    }
-
-    if (includeEmpty) {
-      for (const a of AREAS) {
-        const aa = String(a).padStart(2, '0');
-        if (areaFilter && aa !== areaFilter) continue;
-        if (!byArea.has(aa)) {
-          byArea.set(aa, {
-            area: aa,
-            zones: new Set(),
-            zones_count: 0,
-            last_success_at_latest: null,
-            last_success_at_earliest: null,
-            fetched_at_latest: null,
-            fetched_at_earliest: null,
-            expired_any: null,
-            expired_all: null
-          });
+        const lsStr = entry?.payload?.query?.last_success_at || null;
+        const ls = lsStr ? new Date(lsStr) : null;
+        if (ls) {
+          if (!rec.last_success_at_latest || ls > new Date(rec.last_success_at_latest)) {
+            rec.last_success_at_latest = ls;
+          }
+          if (!rec.last_success_at_earliest || ls < new Date(rec.last_success_at_earliest)) {
+            rec.last_success_at_earliest = ls;
+          }
         }
-      }
-    }
 
-    const out = Array.from(byArea.values()).map(r => ({
-      area: r.area,
-      zones_count: r.zones_count,
-      sample_zones: Array.from(r.zones).slice(0, 5),
-      ttl_seconds: CACHE_TTL_SECONDS,
-      last_success_at_latest: r.last_success_at_latest ? r.last_success_at_latest.toISOString() : null,
-      last_success_at_earliest: r.last_success_at_earliest ? r.last_success_at_earliest.toISOString() : null,
-      fetched_at_latest: r.fetched_at_latest ? r.fetched_at_latest.toISOString() : null,
-      fetched_at_earliest: r.fetched_at_earliest ? r.fetched_at_earliest.toISOString() : null,
-      expired_any: r.expired_any,
-      expired_all: r.expired_all
-    }));
+        const fetched = new Date(entry.fetchedAt);
+        if (!rec.fetched_at_latest || fetched > new Date(rec.fetched_at_latest)) {
+          rec.fetched_at_latest = fetched;
+        }
+        if (!rec.fetched_at_earliest || fetched < new Date(rec.fetched_at_earliest)) {
+          rec.fetched_at_earliest = fetched;
+        }
+
+        const exp = isExpired(entry);
+        rec.expired_any = rec.expired_any || exp;
+        rec.expired_all = rec.expired_all && exp;
+      }
+
+      out.push({
+        area: rec.area,
+        zones_count: rec.zones_count,
+        last_success_at_latest: rec.last_success_at_latest ? rec.last_success_at_latest.toISOString() : null,
+        last_success_at_earliest: rec.last_success_at_earliest ? rec.last_success_at_earliest.toISOString() : null,
+        fetched_at_latest: rec.fetched_at_latest ? rec.fetched_at_latest.toISOString() : null,
+        fetched_at_earliest: rec.fetched_at_earliest ? rec.fetched_at_earliest.toISOString() : null,
+        expired_any: rec.expired_any,
+        expired_all: rec.expired_all
+      });
+    }
 
     out.sort((a, b) => a.area.localeCompare(b.area));
     res.json({ ok: true, areas: out });
@@ -713,43 +640,39 @@ app.post('/admin/refresh', requireCronToken, async (req, res) => {
     // Marcar éxito global
     markIngestOk();
 
-    res.json({ ok: true, ...r });
+    res.json({ ok: true, refreshed: r });
   } catch (err) {
-    // Marcar error global con mensaje técnico
     markIngestError(err);
-    res.status(err.status || 500).json({ ok: false, error: String(err.message || err) });
+    res.status(err?.status || 500).json({ ok: false, error: String(err.message || err) });
   }
 });
 
-// Refrescar todas las áreas configuradas (POST /admin/refresh-all)
-app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
+// Refrescar todas las áreas configuradas (POST /admin/refresh/all)
+app.post('/admin/refresh/all', requireCronToken, async (req, res) => {
   try {
-    const areas = (req.body?.areas && Array.isArray(req.body.areas) ? req.body.areas : AREAS);
-    if (!areas || areas.length === 0) {
-      return res.status(400).json({ ok: false, error: 'No hay áreas definidas. Usa body {"areas":[..]} o variable AREAS.' });
+    const areas = AREAS.length ? AREAS : [];
+    if (!areas.length) {
+      const e = new Error('No hay AREAS configuradas en el entorno.');
+      e.status = 400;
+      throw e;
     }
 
-    // Marcar intento global al inicio
     markIngestAttempt();
 
     const results = [];
-    let anyError = false;
-
-    for (const a of areas) {
-      const a2 = String(a).padStart(2, '0');
+    for (const area of areas) {
       try {
-        const r = await refreshArea(a2);
-        results.push({ area: a2, ok: true, filesCount: r.filesCount });
-        await sleep(250); // pequeño respiro para no saturar AEMET
+        const r = await refreshArea(area);
+        results.push({ area, ok: true, refreshed: r });
       } catch (e) {
-        anyError = true;
-        results.push({ area: a2, ok: false, error: String(e.message || e) });
+        results.push({ area, ok: false, error: String(e?.message || e) });
       }
     }
 
-    if (anyError) {
-      const lastErrItem = [...results].reverse().find(r => r.ok === false);
-      markIngestError({ message: `refresh-all: ${lastErrItem?.area} → ${lastErrItem?.error || 'error'}` });
+    // Si alguna falló, lo marcamos como error global; si todas OK, marcamos OK
+    if (results.some(r => !r.ok)) {
+      const errors = results.filter(r => !r.ok).map(r => `area ${r.area}: ${r.error}`).join(' | ');
+      markIngestError(new Error(errors));
     } else {
       markIngestOk();
     }
@@ -765,3 +688,12 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`AEMET avisos por zona – caché escuchando en :${PORT}`);
 });
+
+// ========================= VALIDACIONES ========================================
+function assertZona(zona) {
+  if (!/^\d{6}$/.test(zona)) {
+    const e = new Error('Parámetro "zona" inválido. Debe ser 6 dígitos (p.ej. 612903).');
+    e.status = 400;
+    throw e;
+  }
+}
