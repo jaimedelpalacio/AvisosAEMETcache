@@ -70,14 +70,46 @@ function isExpired(entry) {
 }
 
 // ========================= HTTP HELPERS ========================================
+// (1) NUEVO: helper de retardo para el backoff
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/**
+ * (1) NUEVO: fetch con reintentos exponenciales + jitter y timeout por intento
+ * - retries: nº de reintentos (además del primer intento)
+ * - baseDelayMs: backoff base (se multiplica por 2^intento)
+ * - timeoutMs: tiempo máximo por intento
+ */
+async function fetchWithRetry(url, opts = {}, { retries = 4, baseDelayMs = 400, timeoutMs = 10000 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(new Error('timeout')), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        ...opts,
+        headers: { 'user-agent': UA, ...(opts.headers || {}) },
+        signal: ctrl.signal
+      });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error(`HTTP ${res.status} al pedir ${url}`);
+      return res; // OK
+    } catch (err) {
+      clearTimeout(timer);
+      if (attempt === retries) throw err; // último intento, propaga
+      const jitter = Math.floor(Math.random() * 250);
+      const delay = baseDelayMs * Math.pow(2, attempt) + jitter;
+      await sleep(delay);
+      // reintenta
+    }
+  }
+}
+
+// (1) CAMBIO: usar fetchWithRetry en estos helpers
 async function tryFetchJSON(url, opts = {}) {
-  const r = await fetch(url, { headers: { 'user-agent': UA }, ...opts });
-  if (!r.ok) throw new Error(`HTTP ${r.status} al pedir ${url}`);
+  const r = await fetchWithRetry(url, opts, { retries: 4, baseDelayMs: 400, timeoutMs: 10000 });
   return r.json();
 }
 async function tryFetchBuffer(url, opts = {}) {
-  const r = await fetch(url, { headers: { 'user-agent': UA }, ...opts });
-  if (!r.ok) throw new Error(`HTTP ${r.status} al pedir ${url}`);
+  const r = await fetchWithRetry(url, opts, { retries: 4, baseDelayMs: 400, timeoutMs: 12000 });
   return Buffer.from(await r.arrayBuffer());
 }
 
@@ -165,7 +197,6 @@ function parseCapXmlWithoutAreas(xmlText) {
     return { header, info: infoList };
   });
 }
-
 
 
 
@@ -540,11 +571,18 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
       }
     }
 
-    if (results.some(r => !r.ok)) {
+    // (2) CAMBIO: reflejar éxito parcial y también registrar errores
+    const anyOk = results.some(r => r.ok);
+    const anyFail = results.some(r => !r.ok);
+
+    if (anyOk) {
+      // Hubo al menos un área con éxito: actualizamos last_ok_at
+      markIngestOk();
+    }
+    if (anyFail) {
+      // Registramos los errores para diagnóstico
       const errors = results.filter(r => !r.ok).map(r => `area ${r.area}: ${r.error}`).join(' | ');
       markIngestError(new Error(errors));
-    } else {
-      markIngestOk();
     }
 
     res.json({ ok: true, results });
