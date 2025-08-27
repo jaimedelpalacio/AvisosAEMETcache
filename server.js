@@ -248,7 +248,7 @@ function fileMatchesZonaByName(fileName, zona) { const m = fileName.match(/AFAZ(
 async function refreshArea(area) {
   if (!AEMET_API_KEY) throw new Error('Falta AEMET_API_KEY en el entorno.');
   // ⚠️ Mantenemos tu URL de catálogo tal cual (no se toca nada más aquí salvo el agregado por zona)
-  const urlCatalogo = `https://opendata.aemet.es/opendata/api/avisos_cap/ultimoselaborados/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
+  const urlCatalogo = `https://opendata.aemet.es/opendata/api/avisos_cap/ultimoelaborado/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
 
   const cat = await tryFetchJSON(urlCatalogo);
   const urlDatos = cat?.datos;
