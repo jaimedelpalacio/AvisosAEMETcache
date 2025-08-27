@@ -116,6 +116,7 @@ function decodeToString(b) { try { return b.toString('utf8'); } catch { return b
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', textNodeName: '#text', trimValues: true });
 function asArray(x) { return Array.isArray(x) ? x : x == null ? [] : [x]; }
 
+
 function parseCapXmlWithoutAreas(xmlText) {
   const root = parser.parse(xmlText);
   const alerts = asArray(root?.alert || root?.['cap:alert']);
@@ -126,26 +127,50 @@ function parseCapXmlWithoutAreas(xmlText) {
       sent: alert?.sent ?? null,
       status: alert?.status ?? null,
       msgType: alert?.msgType ?? null,
-      source: alert?.source ?? null,
-      scope: alert?.scope ?? null
+      scope: alert?.scope ?? null,
     };
-    const infos = asArray(alert?.info).map((inf) => ({
-      language: inf?.language ?? null,
-      category: asArray(inf?.category).filter(Boolean),
-      event: inf?.event ?? null,
-      urgency: inf?.urgency ?? null,
-      severity: inf?.severity ?? null,
-      certainty: inf?.certainty ?? null,
-      effective: inf?.effective ?? null,
-      onset: inf?.onset ?? null,
-      expires: inf?.expires ?? null,
-      headline: inf?.headline ?? null,
-      description: inf?.description ?? null,
-      instruction: inf?.instruction ?? null,
-    }));
-    return { header, info: infos };
+    const infoList = asArray(alert?.info).map((info) => {
+      // Mantenemos todos los campos que tu Programa anterior podía leer
+      const category = asArray(info?.category).map(String);
+      const responseType = asArray(info?.responseType).map(String);
+      const parameters = asArray(info?.parameter).map((p) => ({
+        valueName: p?.valueName ?? p?.['@_valueName'] ?? p?.name ?? null,
+        value: p?.value ?? p?.['#text'] ?? null,
+      }));
+      const eventCode = asArray(info?.eventCode).map((ec) => ({
+        name: ec?.name ?? ec?.['@_name'] ?? null,
+        value: ec?.value ?? ec?.['#text'] ?? null,
+      }));
+
+      return {
+        language: info?.language ?? null,
+        category,
+        event: info?.event ?? null,
+        responseType,                 // <-- restituido
+        urgency: info?.urgency ?? null,
+        severity: info?.severity ?? null,
+        certainty: info?.certainty ?? null,
+        effective: info?.effective ?? null,
+        onset: info?.onset ?? null,
+        expires: info?.expires ?? null,
+        headline: info?.headline ?? null,
+        description: info?.description ?? null,
+        instruction: info?.instruction ?? null,
+        web: info?.web ?? null,       // <-- restituido
+        contact: info?.contact ?? null, // <-- restituido
+        parameters,                   // <-- restituido
+        eventCode                     // <-- restituido
+      };
+    });
+    return { header, info: infoList };
   });
 }
+
+
+
+
+
+
 function parseCap_FOR_MATCHING(xmlText) {
   const root = parser.parse(xmlText);
   const alerts = asArray(root?.alert || root?.['cap:alert']);
@@ -223,7 +248,7 @@ function fileMatchesZonaByName(fileName, zona) { const m = fileName.match(/AFAZ(
 async function refreshArea(area) {
   if (!AEMET_API_KEY) throw new Error('Falta AEMET_API_KEY en el entorno.');
   // ⚠️ Mantenemos tu URL de catálogo tal cual (no se toca nada más aquí salvo el agregado por zona)
-  const urlCatalogo = `https://opendata.aemet.es/opendata/api/avisos_cap/ultimoelaborado/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
+  const urlCatalogo = `https://opendata.aemet.es/opendata/api/avisos_cap/ultimoselaborados/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
 
   const cat = await tryFetchJSON(urlCatalogo);
   const urlDatos = cat?.datos;
@@ -542,4 +567,3 @@ function assertZona(zona) {
     throw e;
   }
 }
-
