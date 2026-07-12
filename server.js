@@ -167,6 +167,7 @@ function parseCapXmlWithoutAreas(xmlText) {
       status: alert?.status ?? null,
       msgType: alert?.msgType ?? null,
       scope: alert?.scope ?? null,
+      references: alert?.references ?? null,
     };
     const infoList = asArray(alert?.info).map((info) => {
       // Mantenemos todos los campos que tu Programa anterior podía leer
@@ -228,16 +229,60 @@ function parseCap_FOR_MATCHING(xmlText) {
 }
 
 function alertHasNonGreenLevel(infos) {
+  // Solo la severidad decide el nivel: Minor/Unknown = verde (fuera).
+  // (Antes bastaba con urgency/certainty distintas de unknown, y como todos los
+  // avisos traen urgency, el filtro de verdes no filtraba nada en la práctica.)
   const arr = asArray(infos);
   for (const inf of arr) {
     const sev = (inf?.severity || '').toLowerCase();
-    const urg = (inf?.urgency || '').toLowerCase();
-    const cer = (inf?.certainty || '').toLowerCase();
     if (sev && sev !== 'minor' && sev !== 'unknown') return true;
-    if (urg && urg !== 'unknown') return true;
-    if (cer && cer !== 'unknown') return true;
   }
   return false;
+}
+
+// Dedup por identifier (gana el "sent" más reciente) y proceso de msgType=Cancel:
+// un Cancel elimina los avisos cuyos identifier aparecen en sus references, y el
+// propio mensaje Cancel tampoco se sirve.
+function consolidateAvisos(avisos) {
+  const cancelled = new Set();
+  for (const av of avisos) {
+    if (String(av?.header?.msgType || '').toLowerCase() !== 'cancel') continue;
+    const refs = String(av?.header?.references || '').trim().split(/\s+/).filter(Boolean);
+    for (const r of refs) {
+      const parts = r.split(','); // formato CAP: "sender,identifier,sent"
+      if (parts.length >= 2 && parts[1]) cancelled.add(parts[1]);
+    }
+  }
+
+  const byId = new Map();
+  const sinId = [];
+  for (const av of avisos) {
+    const h = av?.header || {};
+    if (String(h.msgType || '').toLowerCase() === 'cancel') continue;
+    if (h.identifier && cancelled.has(h.identifier)) continue;
+    if (!h.identifier) { sinId.push(av); continue; }
+    const prev = byId.get(h.identifier);
+    if (!prev) { byId.set(h.identifier, av); continue; }
+    const tPrev = Date.parse(prev?.header?.sent || '') || 0;
+    const tNew = Date.parse(h.sent || '') || 0;
+    if (tNew >= tPrev) byId.set(h.identifier, av);
+  }
+  return [...byId.values(), ...sinId];
+}
+
+// ¿Todos los info del aviso tienen expires en el pasado? (sin expires parseable => no caducado)
+function avisoCaducado(av, nowTs) {
+  const infos = asArray(av?.info);
+  if (!infos.length) return false;
+  let vistos = 0;
+  for (const inf of infos) {
+    if (!inf?.expires) return false;
+    const t = Date.parse(inf.expires);
+    if (isNaN(t)) return false;
+    vistos++;
+    if (t >= nowTs) return false;
+  }
+  return vistos > 0;
 }
 function alertLooksGenericCCAA(infos) {
   const arr = asArray(infos);
@@ -285,6 +330,7 @@ function fileMatchesZonaByName(fileName, zona) { const m = fileName.match(/AFAZ(
 // ========================= REFRESCO DE ÁREA ====================================
 async function refreshArea(area) {
   if (!AEMET_API_KEY) throw new Error('Falta AEMET_API_KEY en el entorno.');
+  const startedMs = nowMs();
   // ⚠️ Mantenemos tu URL de catálogo tal cual (no se toca nada más aquí salvo el agregado por zona)
   const urlCatalogo = `${AEMET_BASE_URL}/opendata/api/avisos_cap/ultimoelaborado/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
 
@@ -357,8 +403,10 @@ async function refreshArea(area) {
 
           const matched = matchedByName || (aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false);
           if (!matched) continue;
-          if (!alertHasNonGreenLevel(aSinAreas?.info)) continue;
-          if (alertLooksGenericCCAA(aSinAreas?.info)) continue;
+          // Los Cancel pasan siempre: consolidateAvisos los usa para anular avisos y luego los descarta
+          const esCancel = String(aSinAreas?.header?.msgType || '').toLowerCase() === 'cancel';
+          if (!esCancel && !alertHasNonGreenLevel(aSinAreas?.info)) continue;
+          if (!esCancel && alertLooksGenericCCAA(aSinAreas?.info)) continue;
 
           const areaDescs = extractAreaDescsForZona(aConAreas, zona);
           avisos.push({ file: fileName, ...aSinAreas, areaDescs });
@@ -401,8 +449,9 @@ async function refreshArea(area) {
         const aConAreas = parsedWithAreas[i];
         const matched = aConAreas ? alertHasZonaByGeocode_WITH_AREAS(aConAreas, zona) : false;
         if (!matched) continue;
-        if (!alertHasNonGreenLevel(aSinAreas?.info)) continue;
-        if (alertLooksGenericCCAA(aSinAreas?.info)) continue;
+        const esCancel = String(aSinAreas?.header?.msgType || '').toLowerCase() === 'cancel';
+        if (!esCancel && !alertHasNonGreenLevel(aSinAreas?.info)) continue;
+        if (!esCancel && alertLooksGenericCCAA(aSinAreas?.info)) continue;
 
         const areaDescs = extractAreaDescsForZona(aConAreas, zona);
         avisos.push({ file: fileName, ...aSinAreas, areaDescs });
@@ -423,7 +472,7 @@ async function refreshArea(area) {
     const newPayload = {
       query: { ...baseQuery, zona },
       ficheros: ficherosFiltrados,
-      avisos: acc.avisos
+      avisos: consolidateAvisos(acc.avisos)
     };
     cacheZona.set(zona, { payload: newPayload, fetchedAt: nowMs(), stale: false });
   }
@@ -444,7 +493,7 @@ async function refreshArea(area) {
     }
   }
 
-  return { area, filesCount: isTar ? (entries?.length || 0) : 1 };
+  return { area, filesCount: isTar ? (entries?.length || 0) : 1, zones: pendingByZona.size, ms: nowMs() - startedMs };
 
   // ================== upsertZona: ACUMULA EN pendingByZona ==================
   function upsertZona(zona, nuevosAvisos, fileList, ctxQuery) {
@@ -472,8 +521,14 @@ async function refreshArea(area) {
 
 // ========================= AUTH PARA ENDPOINTS ADMIN ===========================
 function requireCronToken(req, res, next) {
-  const token = String(req.headers['x-cron-token'] || req.query.cron || '');
-  if (!CRON_TOKEN || token !== CRON_TOKEN) {
+  // Solo por cabecera (el token en query string acaba en logs de peticiones)
+  // y comparación en tiempo constante.
+  const token = Buffer.from(String(req.headers['x-cron-token'] || ''));
+  const expected = Buffer.from(CRON_TOKEN);
+  const ok = CRON_TOKEN.length > 0
+    && token.length === expected.length
+    && crypto.timingSafeEqual(token, expected);
+  if (!ok) {
     const e = new Error('No autorizado (X-Cron-Token incorrecto o ausente).');
     e.status = 401;
     return next(e);
@@ -483,6 +538,9 @@ function requireCronToken(req, res, next) {
 
 // ========================= ENDPOINTS PÚBLICOS ==================================
 app.get('/', (req, res) => res.json({ ok: true, name: 'aemet-avisos-zona-cache' }));
+
+// Evita el ruido de 404 de los crawlers y pide no ser indexado
+app.get('/robots.txt', (req, res) => res.type('text/plain').send('User-agent: *\nDisallow: /\n'));
 
 app.get('/health', (req, res) => {
   const last = {
@@ -522,6 +580,8 @@ app.get('/avisos', (req, res) => {
     const expired = isExpired(entry);
     const payload = {
       ...entry.payload,
+      // Los avisos ya caducados (expires en el pasado) no se sirven
+      avisos: (entry.payload?.avisos || []).filter(av => !avisoCaducado(av, nowMs())),
       stale: Boolean(entry.stale || expired),
       cache: {
         fetched_at: new Date(entry.fetchedAt).toISOString(),
@@ -575,7 +635,16 @@ app.post('/admin/refresh', requireCronToken, async (req, res) => {
 
 // Refresca todas las AREAS en secuencia y actualiza el estado de ingesta.
 // Compartido por /admin/refresh-all y la precarga del arranque.
-async function refreshAllAreas() {
+// Si ya hay un barrido en curso (boot + cron + manual pueden coincidir),
+// se reutiliza su promesa en vez de lanzar otro y duplicar peticiones a AEMET.
+let refreshEnCurso = null;
+function refreshAllAreas() {
+  if (refreshEnCurso) return refreshEnCurso;
+  refreshEnCurso = doRefreshAllAreas().finally(() => { refreshEnCurso = null; });
+  return refreshEnCurso;
+}
+
+async function doRefreshAllAreas() {
   markIngestAttempt();
 
   const results = [];
@@ -614,11 +683,20 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
     }
 
     const results = await refreshAllAreas();
-    res.json({ ok: true, results });
+    const anyOk = results.some(r => r.ok);
+    // Si TODAS las áreas fallan devolvemos 502: el curl -f del cron marca el run como fallido
+    res.status(anyOk ? 200 : 502).json({ ok: anyOk, results });
   } catch (err) {
     markIngestError(err);
-    res.status(500).json({ ok: false, error: String(err.message || err) });
+    res.status(err?.status || 500).json({ ok: false, error: String(err.message || err) });
   }
+});
+
+// ========================= 404 Y ERRORES EN JSON ===============================
+// (evita el HTML con stack trace del handler por defecto de Express)
+app.use((req, res) => res.status(404).json({ error: 'not_found' }));
+app.use((err, req, res, next) => {
+  res.status(err?.status || 500).json({ ok: false, error: String(err?.message || err) });
 });
 
 // ========================= ARRANQUE ============================================
