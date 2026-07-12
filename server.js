@@ -16,6 +16,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const UA = 'MT-Neo-Avisos-Zona/2.x';
 const AEMET_API_KEY = process.env.AEMET_API_KEY || '';
+const AEMET_BASE_URL = process.env.AEMET_BASE_URL || 'https://opendata.aemet.es';
 const CRON_TOKEN = process.env.RENDER_CRON_TOKEN || '';
 const CACHE_TTL_SECONDS = parseInt(process.env.CACHE_TTL_SECONDS || '1200', 10); // 20 min por defecto
 const AREAS = (process.env.AREAS || '').split(',').map(s => s.trim()).filter(Boolean); // p.ej. "61,62,63"
@@ -90,10 +91,16 @@ async function fetchWithRetry(url, opts = {}, { retries = 4, baseDelayMs = 400, 
         signal: ctrl.signal
       });
       clearTimeout(timer);
-      if (!res.ok) throw new Error(`HTTP ${res.status} al pedir ${url}`);
+      if (!res.ok) {
+        const e = new Error(`HTTP ${res.status} al pedir ${url}`);
+        e.httpStatus = res.status;
+        throw e;
+      }
       return res; // OK
     } catch (err) {
       clearTimeout(timer);
+      // 429 = cuota agotada: reintentar solo agrava el problema, propagamos ya
+      if (err?.httpStatus === 429) throw err;
       if (attempt === retries) throw err; // último intento, propaga
       const jitter = Math.floor(Math.random() * 250);
       const delay = baseDelayMs * Math.pow(2, attempt) + jitter;
@@ -279,7 +286,7 @@ function fileMatchesZonaByName(fileName, zona) { const m = fileName.match(/AFAZ(
 async function refreshArea(area) {
   if (!AEMET_API_KEY) throw new Error('Falta AEMET_API_KEY en el entorno.');
   // ⚠️ Mantenemos tu URL de catálogo tal cual (no se toca nada más aquí salvo el agregado por zona)
-  const urlCatalogo = `https://opendata.aemet.es/opendata/api/avisos_cap/ultimoelaborado/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
+  const urlCatalogo = `${AEMET_BASE_URL}/opendata/api/avisos_cap/ultimoelaborado/area/${area}?api_key=${encodeURIComponent(AEMET_API_KEY)}`;
 
   const cat = await tryFetchJSON(urlCatalogo);
   const urlDatos = cat?.datos;
@@ -421,6 +428,22 @@ async function refreshArea(area) {
     cacheZona.set(zona, { payload: newPayload, fetchedAt: nowMs(), stale: false });
   }
 
+  // ================== PURGA: zonas del área sin avisos en este snapshot ==================
+  // Un refresh con éxito es la foto completa del área: las zonas cacheadas de este área
+  // que no aparecen ahora pasan a servir avisos:[] (200 con lista vacía, no 503) en vez
+  // de quedarse congeladas con avisos antiguos.
+  {
+    const areaCode = String(area).padStart(2, '0');
+    for (const zona of cacheZona.keys()) {
+      if (!zona.startsWith(areaCode) || pendingByZona.has(zona)) continue;
+      cacheZona.set(zona, {
+        payload: { query: { ...baseQuery, zona }, ficheros: [], avisos: [] },
+        fetchedAt: nowMs(),
+        stale: false
+      });
+    }
+  }
+
   return { area, filesCount: isTar ? (entries?.length || 0) : 1 };
 
   // ================== upsertZona: ACUMULA EN pendingByZona ==================
@@ -550,41 +573,47 @@ app.post('/admin/refresh', requireCronToken, async (req, res) => {
   }
 });
 
+// Refresca todas las AREAS en secuencia y actualiza el estado de ingesta.
+// Compartido por /admin/refresh-all y la precarga del arranque.
+async function refreshAllAreas() {
+  markIngestAttempt();
+
+  const results = [];
+  for (const area of AREAS) {
+    try {
+      const r = await refreshArea(area);
+      results.push({ area, ok: true, refreshed: r });
+    } catch (e) {
+      results.push({ area, ok: false, error: String(e?.message || e) });
+    }
+  }
+
+  // (2) CAMBIO: reflejar éxito parcial y también registrar errores
+  const anyOk = results.some(r => r.ok);
+  const anyFail = results.some(r => !r.ok);
+
+  if (anyOk) {
+    // Hubo al menos un área con éxito: actualizamos last_ok_at
+    markIngestOk();
+  }
+  if (anyFail) {
+    // Registramos los errores para diagnóstico
+    const errors = results.filter(r => !r.ok).map(r => `area ${r.area}: ${r.error}`).join(' | ');
+    markIngestError(new Error(errors));
+  }
+
+  return results;
+}
+
 app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
   try {
-    const areas = AREAS.length ? AREAS : [];
-    if (!areas.length) {
+    if (!AREAS.length) {
       const e = new Error('No hay AREAS configuradas en el entorno.');
       e.status = 400;
       throw e;
     }
 
-    markIngestAttempt();
-
-    const results = [];
-    for (const area of areas) {
-      try {
-        const r = await refreshArea(area);
-        results.push({ area, ok: true, refreshed: r });
-      } catch (e) {
-        results.push({ area, ok: false, error: String(e?.message || e) });
-      }
-    }
-
-    // (2) CAMBIO: reflejar éxito parcial y también registrar errores
-    const anyOk = results.some(r => r.ok);
-    const anyFail = results.some(r => !r.ok);
-
-    if (anyOk) {
-      // Hubo al menos un área con éxito: actualizamos last_ok_at
-      markIngestOk();
-    }
-    if (anyFail) {
-      // Registramos los errores para diagnóstico
-      const errors = results.filter(r => !r.ok).map(r => `area ${r.area}: ${r.error}`).join(' | ');
-      markIngestError(new Error(errors));
-    }
-
+    const results = await refreshAllAreas();
     res.json({ ok: true, results });
   } catch (err) {
     markIngestError(err);
@@ -595,6 +624,13 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
 // ========================= ARRANQUE ============================================
 app.listen(PORT, () => {
   console.log(`AEMET avisos por zona – caché escuchando en :${PORT}`);
+  // Precarga: tras un deploy/reinicio la caché en memoria queda vacía; en vez de
+  // esperar al siguiente cron (hasta 30 min de 503 cache_miss), refrescamos ya.
+  if (AEMET_API_KEY && AREAS.length) {
+    refreshAllAreas()
+      .then(results => console.log('[BOOT] Precarga de caché:', JSON.stringify(results)))
+      .catch(e => console.error('[BOOT] Precarga fallida:', String(e?.message || e)));
+  }
 });
 
 // ========================= VALIDACIONES ========================================
