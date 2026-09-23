@@ -43,8 +43,19 @@ function markIngestOk() {
 }
 function markIngestError(e) {
   ingestState.last_error_at = new Date().toISOString();
-  ingestState.last_error_message = String(e?.message || e);
+  ingestState.last_error_message = errMsg(e);
 }
+
+// La API key de AEMET va en la URL del catálogo: nunca debe salir en respuestas,
+// mensajes de error ni logs (/avisos y /health son públicos).
+function redactKey(s) {
+  let out = String(s ?? '').replace(/api_key=[^&\s"'<>]*/gi, 'api_key=***');
+  if (AEMET_API_KEY) {
+    out = out.split(AEMET_API_KEY).join('***').split(encodeURIComponent(AEMET_API_KEY)).join('***');
+  }
+  return out;
+}
+function errMsg(e) { return redactKey(String(e?.message || e)); }
 
 function explainError(msg) {
   if (!msg) return null;
@@ -92,7 +103,7 @@ async function fetchWithRetry(url, opts = {}, { retries = 4, baseDelayMs = 400, 
       });
       clearTimeout(timer);
       if (!res.ok) {
-        const e = new Error(`HTTP ${res.status} al pedir ${url}`);
+        const e = new Error(`HTTP ${res.status} al pedir ${redactKey(url)}`);
         e.httpStatus = res.status;
         throw e;
       }
@@ -348,7 +359,7 @@ async function refreshArea(area) {
     try { entries = await extractTarEntries(maybeGz); isTar = true; }
     catch { entries = [{ name: 'single.xml', size: maybeGz.length, sha1: sha1(maybeGz), buffer: maybeGz }]; isTar = false; }
   } catch (e) {
-    throw new Error(`No se pudo descomprimir/explorar el fichero de datos: ${String(e?.message || e)}`);
+    throw new Error(`No se pudo descomprimir/explorar el fichero de datos: ${errMsg(e)}`);
   }
 
   const nowIso = new Date().toISOString();
@@ -358,7 +369,7 @@ async function refreshArea(area) {
 
   const baseQuery = {
     area,
-    url_catalogo: urlCatalogo,
+    url_catalogo: redactKey(urlCatalogo),
     url_datos: urlDatos,
     url_metadatos: cat?.metadatos || null,
     last_success_at: nowIso
@@ -591,7 +602,7 @@ app.get('/avisos', (req, res) => {
     };
     return res.json(payload);
   } catch (err) {
-    return res.status(err?.status || 500).json({ error: String(err?.message || err) });
+    return res.status(err?.status || 500).json({ error: errMsg(err) });
   }
 });
 
@@ -610,7 +621,7 @@ app.get('/areas/status', (req, res) => {
     out.sort((a, b) => a.zona.localeCompare(b.zona));
     res.json({ ok: true, zonas: out });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok: false, error: errMsg(e) });
   }
 });
 
@@ -629,7 +640,7 @@ app.post('/admin/refresh', requireCronToken, async (req, res) => {
     res.json({ ok: true, refreshed: r });
   } catch (err) {
     markIngestError(err);
-    res.status(err?.status || 500).json({ ok: false, error: String(err.message || err) });
+    res.status(err?.status || 500).json({ ok: false, error: errMsg(err) });
   }
 });
 
@@ -653,7 +664,7 @@ async function doRefreshAllAreas() {
       const r = await refreshArea(area);
       results.push({ area, ok: true, refreshed: r });
     } catch (e) {
-      results.push({ area, ok: false, error: String(e?.message || e) });
+      results.push({ area, ok: false, error: errMsg(e) });
     }
   }
 
@@ -688,7 +699,7 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
     res.status(anyOk ? 200 : 502).json({ ok: anyOk, results });
   } catch (err) {
     markIngestError(err);
-    res.status(err?.status || 500).json({ ok: false, error: String(err.message || err) });
+    res.status(err?.status || 500).json({ ok: false, error: errMsg(err) });
   }
 });
 
@@ -696,7 +707,7 @@ app.post('/admin/refresh-all', requireCronToken, async (req, res) => {
 // (evita el HTML con stack trace del handler por defecto de Express)
 app.use((req, res) => res.status(404).json({ error: 'not_found' }));
 app.use((err, req, res, next) => {
-  res.status(err?.status || 500).json({ ok: false, error: String(err?.message || err) });
+  res.status(err?.status || 500).json({ ok: false, error: errMsg(err) });
 });
 
 // ========================= ARRANQUE ============================================
@@ -707,7 +718,7 @@ app.listen(PORT, () => {
   if (AEMET_API_KEY && AREAS.length) {
     refreshAllAreas()
       .then(results => console.log('[BOOT] Precarga de caché:', JSON.stringify(results)))
-      .catch(e => console.error('[BOOT] Precarga fallida:', String(e?.message || e)));
+      .catch(e => console.error('[BOOT] Precarga fallida:', errMsg(e)));
   }
 });
 
